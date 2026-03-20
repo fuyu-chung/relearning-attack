@@ -1,9 +1,11 @@
+import json
 import os
 import yaml
 import torch
 from argparse import ArgumentParser
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 from utils.io_utils import read_jsonl, write_jsonl
 
 
@@ -27,11 +29,36 @@ Answer:"""
 _TOOL_LEAK = ["<call", "action input", "function(", "observation:"]
 
 
+def load_config(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def load_model(model_path: str):
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        use_fast=False,
+        local_files_only=True,
+        legacy=True,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map="auto",
+        torch_dtype=torch.float16,
+        local_files_only=True,
+    )
+    model.eval()
+    return tokenizer, model
+
+
 def clean_yprime(answer: str) -> str:
     if not answer or len(answer) < 10:
         return ""
     if any(p in answer.lower() for p in _TOOL_LEAK):
-        print(f"⚠️  過濾掉: {answer[:80]}")
+        print(f"Filtered: {answer[:80]}")
         return ""
     return answer.strip()
 
@@ -59,11 +86,6 @@ def generate_yprime(
     return clean_yprime(answer)
 
 
-def load_config(path: str) -> dict:
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
 def main():
     ap = ArgumentParser()
     ap.add_argument("--config", default="configs/base.yaml")
@@ -71,71 +93,74 @@ def main():
 
     cfg = load_config(args.config)
 
-    forget_sft = cfg["forget_sft"]
-    out_jsonl = cfg["yprime_out"]
-    checkpoint_path = out_jsonl.replace(".jsonl", "_ckpt.jsonl")
+    data = read_jsonl(cfg["forget_sft"])
+    print(f"Loaded {len(data)} instances from {cfg['forget_sft']}")
 
-    data = (
-        read_jsonl(checkpoint_path)
-        if os.path.exists(checkpoint_path)
-        else read_jsonl(forget_sft)
-    )
-    print(f"Loaded {len(data)} instances")
+    tokenizer, model = load_model(cfg["model_path"])
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        cfg["model_path"],
-        use_fast=False,
-        local_files_only=True,
-        legacy=True,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    output_path = cfg["yprime_out"]
+    done_ids = set()
+    if os.path.exists(output_path):
+        done = read_jsonl(output_path)
+        done_ids = {r["instance_id"] for r in done if r.get("y_prime", "")}
+        print(f"Resuming: {len(done_ids)} already done")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg["model_path"],
-        device_map="auto",
-        torch_dtype=torch.float16,
-        local_files_only=True,
-    )
-    model.eval()
+    print(f"\nStart generating ({len(data)} samples)...")
 
     success = skipped = 0
 
-    for i, inst in enumerate(tqdm(data, desc="Generating Y'")):
-        if inst.get("y_prime", ""):
-            continue
+    with open(output_path, "a", encoding="utf-8") as f:
+        for inst in tqdm(data, desc="Generating Y'"):
+            instance_id = inst.get("instance_id", "")
+            if instance_id in done_ids:
+                continue
 
-        messages = inst.get("messages", [])
-        question = messages[0]["content"].strip() if messages else ""
-        tool_name = inst.get("Name", "unknown tool")
+            messages = inst.get("messages", [])
+            question = messages[0]["content"].strip() if messages else ""
+            tool_name = inst.get("Name", "unknown tool")
 
-        if not question:
-            inst["y_prime"] = ""
-            skipped += 1
-            continue
+            if not question:
+                skipped += 1
+                continue
 
-        answer = generate_yprime(
-            model, tokenizer, question, tool_name, cfg["max_new_tokens"]
-        )
+            try:
+                answer = generate_yprime(
+                    model, tokenizer, question, tool_name, cfg["max_new_tokens"]
+                )
+                row = {
+                    "instance_id": instance_id,
+                    "Name": tool_name,
+                    "nl_doc": inst.get("nl_doc", ""),
+                    "tool_names": inst.get("tool_names", ""),
+                    "y_prime": answer,
+                    "messages": [
+                        {"role": "user", "content": question},
+                        {"role": "assistant", "content": answer},
+                    ],
+                }
+                if answer:
+                    success += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                print(f"Skip {instance_id}: {e}")
+                row = {
+                    "instance_id": instance_id,
+                    "Name": tool_name,
+                    "nl_doc": inst.get("nl_doc", ""),
+                    "tool_names": inst.get("tool_names", ""),
+                    "y_prime": "",
+                    "messages": inst.get("messages", []),
+                }
+                skipped += 1
 
-        inst["y_prime"] = answer
-        if answer:
-            inst["messages"][1]["content"] = answer
-            success += 1
-        else:
-            skipped += 1
-
-        if (i + 1) % cfg["checkpoint_every"] == 0:
-            write_jsonl(checkpoint_path, data)
-
-    write_jsonl(out_jsonl, data)
-    if os.path.exists(checkpoint_path):
-        os.remove(checkpoint_path)
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            f.flush()
 
     print(f"Total:   {len(data)}")
     print(f"Success: {success}")
     print(f"Skipped: {skipped}")
-    print(f"Output:  {out_jsonl}")
+    print(f"Saved to: {output_path}")
 
 
 if __name__ == "__main__":

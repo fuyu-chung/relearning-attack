@@ -1,4 +1,4 @@
-# prep_toolalpaca.py
+# prep_train.py
 in_json: data/train_data.json
 out_dir: out
 forget_ratio: 0.2
@@ -8,18 +8,12 @@ forget_sft: out/forget_sft.jsonl
 yprime_out: out/forget_sft_yprime.jsonl
 model_path: models/vicuna-7b
 max_new_tokens: 256
-checkpoint_every: 50
 
 # eval_generate.py
-eval_files:
-  test: out/eval_simulated.jsonl
-  forget: out/forget_sft.jsonl
-  retain: out/retain_sft.jsonl
-output_file: out/generated_traces.jsonl
-toolalpaca_model: TangQiaoYu/ToolAlpaca-7B
-
-# prep_eval.py
 eval_raw: data/eval_simulated.json
-eval_file: out/eval_simulated.jsonl
+output_file: out/generated_traces.jsonl
+toolalpaca_model: models/toolalpaca-7b
 
-judge_model: meta-llama/Meta-Llama-3.1-8B-Instruct
+# eval_judge.py
+judge_model: models/llama3-8b-instruct
+mmlu_samples: 20

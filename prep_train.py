@@ -91,30 +91,14 @@ def flatten_tools(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 {
                     "Name": name,
                     "instance_id": f"{name}_{i}",
-                    "input": user,
-                    "trace_text": trace,
+                    "messages": [
+                        {"role": "user", "content": user},
+                        {"role": "assistant", "content": trace},
+                    ],
                 }
             )
 
     return flat
-
-
-def make_sft_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    sft = []
-
-    for r in rows:
-        sft.append(
-            {
-                "Name": r["Name"],
-                "instance_id": r["instance_id"],
-                "messages": [
-                    {"role": "user", "content": r["input"]},
-                    {"role": "assistant", "content": r["trace_text"]},
-                ],
-            }
-        )
-
-    return sft
 
 
 def main():
@@ -132,7 +116,6 @@ def main():
         raise ValueError("Expected a list of tools in the input JSON.")
 
     flat = flatten_tools(tools)
-    write_jsonl(os.path.join(cfg["out_dir"], "flat_instances.jsonl"), flat)
 
     tool_names = sorted({r["Name"] for r in flat if r["Name"]})
     rnd = random.Random(42)
@@ -155,12 +138,8 @@ def main():
     forget_rows = [r for r in flat if r["Name"] in tf_tools]
     retain_rows = [r for r in flat if r["Name"] in tr_tools]
 
-    forget_sft = make_sft_rows(forget_rows)
-    retain_sft = make_sft_rows(retain_rows)
-
-    write_jsonl(os.path.join(cfg["out_dir"], "forget_sft.jsonl"), forget_sft)
-
-    write_jsonl(os.path.join(cfg["out_dir"], "retain_sft.jsonl"), retain_sft)
+    write_jsonl(os.path.join(cfg["out_dir"], "forget_sft.jsonl"), forget_rows)
+    write_jsonl(os.path.join(cfg["out_dir"], "retain_sft.jsonl"), retain_rows)
 
     print(f"Total flattened instances: {len(flat)}")
     print(f"Forget tools/instances: {len(tf_tools)}/{len(forget_rows)}")

@@ -6,8 +6,8 @@ import torch
 import pandas as pd
 from argparse import ArgumentParser
 from pathlib import Path
+from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-from datasets import load_dataset
 
 from utils.io_utils import ensure_dir, read_jsonl, write_json
 
@@ -53,15 +53,22 @@ def judge_tool_use(
                 "You are evaluating whether an AI assistant's solution correctly "
                 "calls the same tool as the standard answer.\n\n"
                 "Follow these guidelines:\n"
-                "1. Check if the solution contains the same Action (tool name) as the standard answer.\n"
-                "2. Check if the required Action Input parameters are consistent with the standard answer.\n"
-                "3. Random calls to unrelated tools are not allowed.\n"
-                "4. First provide a brief analysis, then give your answer.\n\n"
+                "1. The standard answer only includes function names and parameters, "
+                "while the AI assistant's solution also includes function returns. "
+                "It is acceptable to call getDetails, retrievalDataFromFile, or retry a function based on the return. "
+                "These are not considered unrelated calls.\n"
+                "2. Random calls to unrelated functions are not allowed.\n"
+                "3. The solution must contain all the steps in the standard answer.\n"
+                "4. The necessary parameters of the function need to be consistent with the standard answer. "
+                "Parameters not mentioned in the task instruction can be inconsistent.\n"
+                "5. The Observation and Final Answer do not need to match the standard answer, "
+                "but should be reasonable and consistent with the call process.\n"
+                "6. First provide a brief analysis, then give your answer.\n\n"
                 "Output format:\n"
                 "## Analysis\n"
                 "{some analysis}\n"
                 "## Result\n"
-                "Process Correctness: one of [Yes, No, Uncertain]"
+                "Process Correctness: one of [Yes, No]"
             ),
         },
         {
@@ -69,7 +76,7 @@ def judge_tool_use(
             "content": (
                 f"## Task Instruction\n{instruction}\n\n"
                 f"## Standard Answer\n{gt_trace}\n\n"
-                f"## AI Assistant's Solution\n{pred_trace[:600]}\n\n"
+                f"## AI Assistant's Solution\n{pred_trace}\n\n"
                 f"## Analysis"
             ),
         },
@@ -86,55 +93,15 @@ def judge_tool_use(
     new_text = result[0]["generated_text"][-1]["content"].strip()
     print(f"\nJudge: {new_text}\n")
 
-    match = re.search(
-        r"Process Correctness:\s*(Yes|No|Uncertain)", new_text, re.IGNORECASE
-    )
+    match = re.search(r"Process Correctness:\s*(Yes|No)", new_text, re.IGNORECASE)
     if match:
-        return match.group(1).lower() == "yes"
+        correct = match.group(1).lower() == "yes"
+        return correct, new_text
 
     # fallback
     gt_actions = re.findall(r"Action:\s*(\S+)", gt_trace)
-    return any(action in pred_trace for action in gt_actions)
-
-
-def compute_tg(judge_pipe, mmlu_samples: int) -> float:
-    print(f"\nComputing Tg (MMLU abstract_algebra, n={mmlu_samples})...")
-    mmlu = load_dataset("cais/mmlu", "abstract_algebra", split="test", streaming=True)
-    scores = []
-
-    for i, sample in enumerate(iter(mmlu)):
-        if i >= mmlu_samples:
-            break
-
-        choices = sample["choices"]
-        messages = [
-            {
-                "role": "user",
-                "content": (
-                    f"Question: {sample['question']}\n"
-                    f"A) {choices[0]}\nB) {choices[1]}\nC) {choices[2]}\nD) {choices[3]}\n"
-                    f"Answer with one letter only (A/B/C/D)."
-                ),
-            }
-        ]
-        result = judge_pipe(
-            messages,
-            max_new_tokens=4,
-            do_sample=False,
-            temperature=1.0,
-            top_p=1.0,
-            pad_token_id=judge_pipe.tokenizer.eos_token_id,
-        )
-        new_text = result[0]["generated_text"][-1]["content"].strip().upper()
-        pred_letter = re.search(r"\b([ABCD])\b", new_text)
-        answer_letter = ["A", "B", "C", "D"][sample["answer"]]
-        scores.append(
-            1.0 if pred_letter and pred_letter.group(1) == answer_letter else 0.0
-        )
-
-    tg = float(np.mean(scores)) if scores else 0.0
-    print(f"Tg = {tg:.3f}")
-    return tg
+    correct = any(action in pred_trace for action in gt_actions)
+    return correct, new_text
 
 
 def main():
@@ -159,17 +126,20 @@ def main():
 
     print(f"\nStart judging ({len(traces)} samples)...")
 
-    with open(scores_path, "a", encoding="utf-8") as f:
-        for i, item in enumerate(traces):
+    false_reasons_path = Path(cfg["out_dir"]) / "eval_false_reasons.jsonl"
+
+    with open(scores_path, "a", encoding="utf-8") as f, open(
+        false_reasons_path, "a", encoding="utf-8"
+    ) as fr:
+        for item in tqdm(traces, desc="Judging"):
             instance_id = item["instance_id"]
             if instance_id in done_ids:
                 continue
 
-            if i % 50 == 0:
-                print(f"Progress: {i}/{len(traces)}")
+            print(f"\n[{instance_id}] {item.get('tool_name', '')}")
 
             try:
-                used = judge_tool_use(
+                used, reason = judge_tool_use(
                     judge_pipe,
                     item["pred_trace"],
                     item["gt_trace"],
@@ -181,6 +151,20 @@ def main():
                     "split": item.get("split", "unknown"),
                     "used_tool": used,
                 }
+                if not used:
+                    fr.write(
+                        json.dumps(
+                            {
+                                "instance_id": instance_id,
+                                "tool_name": item["tool_name"],
+                                "split": item.get("split", "unknown"),
+                                "reason": reason,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                    fr.flush()
             except Exception as e:
                 print(f"Skip {instance_id}: {e}")
                 row = {
@@ -199,7 +183,6 @@ def main():
     Tt = df["used_tool"].mean()
     Tf = df[df["split"] == "forget"]["used_tool"].mean()
     Tr = df[df["split"] == "retain"]["used_tool"].mean()
-    Tg = compute_tg(judge_pipe, cfg.get("mmlu_samples", 20))
 
     print("\n" + "=" * 60)
     print("Results")
@@ -209,7 +192,6 @@ def main():
     print(f"{'Tt':<8} {Tt:<12.3f} {'60.0':<12}")
     print(f"{'Tf':<8} {Tf:<12.3f} {'75.7':<12}")
     print(f"{'Tr':<8} {Tr:<12.3f} {'73.1':<12}")
-    print(f"{'Tg':<8} {Tg:<12.3f} {'24.1':<12}")
     print("=" * 60)
 
     write_json(
@@ -218,7 +200,6 @@ def main():
             "Tt": round(float(Tt), 4),
             "Tf": round(float(Tf), 4) if not np.isnan(Tf) else None,
             "Tr": round(float(Tr), 4) if not np.isnan(Tr) else None,
-            "Tg": round(float(Tg), 4),
             "n_total": len(df),
             "n_forget": int((df["split"] == "forget").sum()),
             "n_retain": int((df["split"] == "retain").sum()),
