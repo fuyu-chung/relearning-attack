@@ -36,7 +36,6 @@ def load_model(model_name: str):
 
 
 def get_tool_names(nl_doc: str) -> str:
-    # 只抓函式名稱：行首、非 Parameters/Output/Structure/Format 開頭
     _SKIP = {"Parameters", "Output", "Structure", "Format"}
     names = [
         m
@@ -58,7 +57,6 @@ def safe_str(x) -> str:
 
 
 def serialize_golden(actions: list) -> str:
-    """eval_simulated.json 的 Golden_Answers 格式，不含 Observation"""
     lines = []
     for step in actions:
         action = safe_str(step.get("Action", "")).strip()
@@ -79,7 +77,6 @@ def serialize_golden(actions: list) -> str:
 
 
 def parse_intermediate_steps(steps) -> list:
-    """train_data.json 的 intermediate_steps 格式"""
     parsed = []
     if not isinstance(steps, list):
         return parsed
@@ -104,7 +101,6 @@ def parse_intermediate_steps(steps) -> list:
 
 
 def serialize_trace(instance: dict) -> str:
-    """train_data.json 的 Instances 格式，不含 Observation"""
     lines = []
     for thought, action, action_input in parse_intermediate_steps(
         instance.get("intermediate_steps", [])
@@ -127,46 +123,11 @@ def load_data(cfg: dict) -> list:
     tf_tools = set(split["tf_tools"])
     tr_tools = set(split["tr_tools"])
 
-    all_data = []
+    eval_data = []
+    forget_data = []
+    retain_data = []
 
-    # forget + retain：從 train_data.json 當場 flatten
-    train_tools = read_json(cfg["in_json"])
-    for t in train_tools:
-        name = t.get("Name", "")
-        if name not in tf_tools and name not in tr_tools:
-            continue
-        split_label = "forget" if name in tf_tools else "retain"
-        nl_doc = t.get("NLDocumentation", "")
-        tool_names = get_tool_names(nl_doc)
-        instances = t.get("Instances", [])
-        if not isinstance(instances, list):
-            continue
-        for i, inst in enumerate(instances):
-            if not isinstance(inst, dict):
-                continue
-            user = safe_str(inst.get("input", "")).strip()
-            gt_trace = serialize_trace(inst).strip()
-            if not user or not gt_trace:
-                continue
-            all_data.append(
-                {
-                    "Name": name,
-                    "instance_id": f"{name}_{i}",
-                    "nl_doc": nl_doc,
-                    "tool_names": tool_names,
-                    "user_input": user,
-                    "gt_trace": gt_trace,
-                    "_split": split_label,
-                }
-            )
-
-    n_forget = sum(1 for r in all_data if r["_split"] == "forget")
-    n_retain = sum(1 for r in all_data if r["_split"] == "retain")
-    print(f"  train_data.json: forget={n_forget}, retain={n_retain}")
-
-    # test：從 eval_simulated.json 當場 flatten
     eval_tools = read_json(cfg["eval_raw"])
-    n_test = 0
     for t in eval_tools:
         name = t.get("Name", "")
         nl_doc = t.get("NLDocumentation", "")
@@ -177,7 +138,7 @@ def load_data(cfg: dict) -> list:
             gt_trace = serialize_golden(golden)
             if not instruction or not gt_trace:
                 continue
-            all_data.append(
+            eval_data.append(
                 {
                     "Name": name,
                     "instance_id": f"{name}_{i}",
@@ -188,8 +149,65 @@ def load_data(cfg: dict) -> list:
                     "_split": "test",
                 }
             )
-            n_test += 1
-    print(f"  eval_simulated.json: test={n_test}")
+
+    from pathlib import Path as _Path
+
+    forget_sft = read_jsonl(cfg["forget_sft"])
+    retain_sft = read_jsonl(cfg["retain_sft"])
+
+    nl_map = {}
+    train_tools = read_json(cfg["in_json"])
+    for t in train_tools:
+        name = t.get("Name", "")
+        nl_doc = t.get("NLDocumentation", "")
+        nl_map[name] = (nl_doc, get_tool_names(nl_doc))
+
+    for r in forget_sft:
+        name = r["Name"]
+        iid = r["instance_id"]
+        user = r.get("messages", [{}])[0].get("content", "")
+        nl_doc, tool_names_str = nl_map.get(name, ("", ""))
+        forget_data.append(
+            {
+                "Name": name,
+                "instance_id": iid,
+                "nl_doc": nl_doc,
+                "tool_names": tool_names_str,
+                "user_input": user,
+                "gt_trace": (
+                    r.get("messages", [{}, {}])[1].get("content", "")
+                    if len(r.get("messages", [])) > 1
+                    else ""
+                ),
+                "_split": "forget",
+            }
+        )
+
+    for r in retain_sft:
+        name = r["Name"]
+        iid = r["instance_id"]
+        user = r.get("messages", [{}])[0].get("content", "")
+        nl_doc, tool_names_str = nl_map.get(name, ("", ""))
+        retain_data.append(
+            {
+                "Name": name,
+                "instance_id": iid,
+                "nl_doc": nl_doc,
+                "tool_names": tool_names_str,
+                "user_input": user,
+                "gt_trace": (
+                    r.get("messages", [{}, {}])[1].get("content", "")
+                    if len(r.get("messages", [])) > 1
+                    else ""
+                ),
+                "_split": "retain",
+            }
+        )
+
+    all_data = eval_data + forget_data + retain_data
+    print(
+        f"  eval={len(eval_data)}, forget={len(forget_data)}, retain={len(retain_data)}"
+    )
     print(f"Total samples: {len(all_data)}")
 
     return all_data
@@ -265,11 +283,15 @@ def main():
 
     print(f"\nStart generating ({len(eval_data)} samples)...")
 
+    total = len(eval_data)
+    remaining = [item for item in eval_data if item["instance_id"] not in done_ids]
+    print(f"Remaining: {len(remaining)} / {total}")
+
     with open(output_path, "a", encoding="utf-8") as f:
-        for item in tqdm(eval_data, desc="Generating traces"):
+        for item in tqdm(
+            remaining, desc=f"Generating traces (done={len(done_ids)}/{total})"
+        ):
             instance_id = item["instance_id"]
-            if instance_id in done_ids:
-                continue
 
             try:
                 pred_trace = generate_trace(
@@ -284,8 +306,8 @@ def main():
                 print(f"Pred: {pred_trace}")
                 print("─" * 60)
                 row = {
+                    "Name": item["Name"],
                     "instance_id": instance_id,
-                    "tool_name": item["Name"],
                     "split": item["_split"],
                     "input": item["user_input"],
                     "gt_trace": item["gt_trace"],
@@ -294,8 +316,8 @@ def main():
             except Exception as e:
                 print(f"Skip {instance_id}: {e}")
                 row = {
+                    "Name": item["Name"],
                     "instance_id": instance_id,
-                    "tool_name": item["Name"],
                     "split": item["_split"],
                     "input": item["user_input"],
                     "gt_trace": item["gt_trace"],
@@ -309,7 +331,6 @@ def main():
 
     del model
     torch.cuda.empty_cache()
-    print("VRAM released.")
 
 
 if __name__ == "__main__":

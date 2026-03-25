@@ -1,0 +1,9 @@
+numpy==1.26.4
+pandas==2.2.2
+PyYAML==5.4.1
+torch==2.4.1+cu121
+tqdm==4.67.1
+transformers==4.46.1
+accelerate==0.33.0
+sentencepiece==0.2.1
+bitsandbytes==0.44.0

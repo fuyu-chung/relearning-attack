@@ -128,15 +128,13 @@ def main():
                     model, tokenizer, question, tool_name, cfg["max_new_tokens"]
                 )
                 row = {
-                    "instance_id": instance_id,
                     "Name": tool_name,
-                    "nl_doc": inst.get("nl_doc", ""),
-                    "tool_names": inst.get("tool_names", ""),
-                    "y_prime": answer,
+                    "instance_id": instance_id,
                     "messages": [
                         {"role": "user", "content": question},
                         {"role": "assistant", "content": answer},
                     ],
+                    "y_prime": answer,
                 }
                 if answer:
                     success += 1
@@ -145,12 +143,10 @@ def main():
             except Exception as e:
                 print(f"Skip {instance_id}: {e}")
                 row = {
-                    "instance_id": instance_id,
                     "Name": tool_name,
-                    "nl_doc": inst.get("nl_doc", ""),
-                    "tool_names": inst.get("tool_names", ""),
-                    "y_prime": "",
+                    "instance_id": instance_id,
                     "messages": inst.get("messages", []),
+                    "y_prime": "",
                 }
                 skipped += 1
 
