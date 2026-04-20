@@ -6,8 +6,9 @@ from argparse import ArgumentParser
 from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 
-from utils.io_utils import ensure_dir, read_json, read_jsonl, write_json
+from utils.io_utils import ensure_dir, read_json, read_jsonl
 
 
 def load_config(path: str) -> dict:
@@ -15,7 +16,50 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def load_model(model_name: str):
+def load_model(
+    model_name: str, base_model: str | None = None, offload_dir: str | None = None
+):
+    model_path = Path(model_name)
+    if offload_dir:
+        ensure_dir(offload_dir)
+    is_adapter_dir = (
+        model_path.is_dir() and (model_path / "adapter_config.json").exists()
+    )
+
+    # LoRA adapter dirs do not contain config.json for AutoModel; load base then attach adapter.
+    if is_adapter_dir:
+        adapter_cfg = read_json(str(model_path / "adapter_config.json"))
+        resolved_base = base_model or adapter_cfg.get("base_model_name_or_path")
+        if not resolved_base:
+            raise ValueError(
+                f"Adapter path {model_name} requires base model. Set base_model in config."
+            )
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            use_fast=False,
+            local_files_only=True,
+            legacy=True,
+        )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        base = AutoModelForCausalLM.from_pretrained(
+            resolved_base,
+            device_map="auto",
+            torch_dtype=torch.float16,
+            local_files_only=True,
+            offload_folder=offload_dir,
+        )
+        model = PeftModel.from_pretrained(
+            base,
+            model_name,
+            local_files_only=True,
+            offload_folder=offload_dir,
+        )
+        model.eval()
+        return tokenizer, model
+
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
         use_fast=False,
@@ -30,6 +74,7 @@ def load_model(model_name: str):
         device_map="auto",
         torch_dtype=torch.float16,
         local_files_only=True,
+        offload_folder=offload_dir,
     )
     model.eval()
     return tokenizer, model
@@ -76,58 +121,40 @@ def serialize_golden(actions: list) -> str:
     return "\n".join(lines).strip()
 
 
-def parse_intermediate_steps(steps) -> list:
-    parsed = []
-    if not isinstance(steps, list):
-        return parsed
-    for step in steps:
-        if not isinstance(step, list) or len(step) < 1:
-            continue
-        action_part = step[0]
-        triplet = None
-        if isinstance(action_part, list):
-            if action_part and isinstance(action_part[0], list):
-                triplet = action_part[0]
-            elif len(action_part) >= 2 and isinstance(action_part[0], str):
-                triplet = action_part
-        if not isinstance(triplet, list) or len(triplet) < 2:
-            continue
-        action = safe_str(triplet[0]).strip()
-        action_input = safe_str(triplet[1]).strip()
-        raw_thought = safe_str(triplet[2]).strip() if len(triplet) >= 3 else ""
-        thought = raw_thought.split("\nAction:")[0].strip()
-        parsed.append((thought, action, action_input))
-    return parsed
-
-
-def serialize_trace(instance: dict) -> str:
-    lines = []
-    for thought, action, action_input in parse_intermediate_steps(
-        instance.get("intermediate_steps", [])
-    ):
-        if thought:
-            lines.append(f"Thought: {thought}")
-        if action:
-            lines.append(f"Action: {action}")
-        if action_input:
-            lines.append(f"Action Input: {action_input}")
-        lines.append("")
-    final = safe_str(instance.get("output", "")).strip()
-    if final:
-        lines.append(f"Final Answer: {final}")
-    return "\n".join(lines).strip()
+def build_output_row(
+    name: str,
+    instance_id: str,
+    split: str,
+    user_input: str,
+    gt_trace: str,
+    pred_trace: str,
+) -> dict:
+    return {
+        "Name": name,
+        "instance_id": instance_id,
+        "split": split,
+        "input": user_input,
+        "gt_trace": gt_trace,
+        "pred_trace": pred_trace,
+    }
 
 
 def load_data(cfg: dict) -> list:
-    split = read_json(str(Path(cfg["out_dir"]) / "split_tools.json"))
-    tf_tools = set(split["tf_tools"])
-    tr_tools = set(split["tr_tools"])
-
     eval_data = []
     forget_data = []
     retain_data = []
 
-    eval_tools = read_json(cfg["eval_raw"])
+    eval_raw_path = cfg.get("eval_tools_path")
+    train_tools_path = cfg.get("train_tools_path")
+    if not eval_raw_path or not train_tools_path:
+        raise ValueError("Need eval_tools_path and train_tools_path")
+
+    eval_tools = read_json(eval_raw_path)
+    train_tools = read_json(train_tools_path)
+    eval_tool_map = {t["Name"]: t for t in eval_tools}
+    train_tool_map = {t["Name"]: t for t in train_tools}
+
+    # test 資料查 eval_tools
     for t in eval_tools:
         name = t.get("Name", "")
         nl_doc = t.get("NLDocumentation", "")
@@ -146,40 +173,38 @@ def load_data(cfg: dict) -> list:
                     "tool_names": tool_names,
                     "user_input": instruction.strip(),
                     "gt_trace": gt_trace,
-                    "_split": "test",
+                    "split": "test",
                 }
             )
 
-    from pathlib import Path as _Path
-
-    forget_sft = read_jsonl(cfg["forget_sft"])
-    retain_sft = read_jsonl(cfg["retain_sft"])
-
-    nl_map = {}
-    train_tools = read_json(cfg["in_json"])
-    for t in train_tools:
-        name = t.get("Name", "")
-        nl_doc = t.get("NLDocumentation", "")
-        nl_map[name] = (nl_doc, get_tool_names(nl_doc))
+    # forget/retain 查 train_tools
+    forget_sft_path = cfg.get("forget_data_path")
+    retain_sft_path = cfg.get("retain_data_path")
+    if not forget_sft_path or not retain_sft_path:
+        raise ValueError("Need forget_data_path and retain_data_path")
+    forget_sft = read_jsonl(forget_sft_path)
+    retain_sft = read_jsonl(retain_sft_path)
 
     for r in forget_sft:
         name = r["Name"]
         iid = r["instance_id"]
         user = r.get("messages", [{}])[0].get("content", "")
-        nl_doc, tool_names_str = nl_map.get(name, ("", ""))
+        tool = train_tool_map.get(name, {})
+        nl_doc = tool.get("NLDocumentation", "")
+        tool_names = get_tool_names(nl_doc)
         forget_data.append(
             {
                 "Name": name,
                 "instance_id": iid,
                 "nl_doc": nl_doc,
-                "tool_names": tool_names_str,
+                "tool_names": tool_names,
                 "user_input": user,
                 "gt_trace": (
                     r.get("messages", [{}, {}])[1].get("content", "")
                     if len(r.get("messages", [])) > 1
                     else ""
                 ),
-                "_split": "forget",
+                "split": "forget",
             }
         )
 
@@ -187,20 +212,22 @@ def load_data(cfg: dict) -> list:
         name = r["Name"]
         iid = r["instance_id"]
         user = r.get("messages", [{}])[0].get("content", "")
-        nl_doc, tool_names_str = nl_map.get(name, ("", ""))
+        tool = train_tool_map.get(name, {})
+        nl_doc = tool.get("NLDocumentation", "")
+        tool_names = get_tool_names(nl_doc)
         retain_data.append(
             {
                 "Name": name,
                 "instance_id": iid,
                 "nl_doc": nl_doc,
-                "tool_names": tool_names_str,
+                "tool_names": tool_names,
                 "user_input": user,
                 "gt_trace": (
                     r.get("messages", [{}, {}])[1].get("content", "")
                     if len(r.get("messages", [])) > 1
                     else ""
                 ),
-                "_split": "retain",
+                "split": "retain",
             }
         )
 
@@ -209,7 +236,6 @@ def load_data(cfg: dict) -> list:
         f"  eval={len(eval_data)}, forget={len(forget_data)}, retain={len(retain_data)}"
     )
     print(f"Total samples: {len(all_data)}")
-
     return all_data
 
 
@@ -247,12 +273,24 @@ def generate_trace(
         max_length=2048,
     ).to(model.device)
 
+    # 允許 config 控制生成參數，否則預設 deterministic
+    gen_cfg = getattr(model, "generation_config", None)
+    max_new_tokens = getattr(gen_cfg, "max_new_tokens", 512) if gen_cfg else 512
+    temperature = getattr(gen_cfg, "temperature", 1.0) if gen_cfg else 1.0
+    do_sample = getattr(gen_cfg, "do_sample", False) if gen_cfg else False
+    # 允許 config 覆蓋
+    if "max_new_tokens" in getattr(model, "config", {}):
+        max_new_tokens = model.config.max_new_tokens
+    if "temperature" in getattr(model, "config", {}):
+        temperature = model.config.temperature
+    if "do_sample" in getattr(model, "config", {}):
+        do_sample = model.config.do_sample
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=512,
-            temperature=0.7,
-            do_sample=True,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=do_sample,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
@@ -265,21 +303,39 @@ def generate_trace(
 
 def main():
     ap = ArgumentParser()
-    ap.add_argument("--config", default="configs/base.yaml")
+    ap.add_argument("--config", default="configs/eval_generate.yaml")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    model_path = (
+        cfg.get("model_path")
+        or cfg.get("adapter_model_path")
+        or cfg.get("base_model_path")
+    )
+    base_model = cfg.get("base_model_path")
+    offload_dir = cfg.get("offload_dir")
+    output_path_str = cfg.get("output_path")
 
-    ensure_dir(cfg["out_dir"])
-    tokenizer, model = load_model(cfg["toolalpaca_model"])
+    if not model_path or not output_path_str:
+        raise ValueError(
+            "Need model_path (or adapter_model_path / base_model_path), and output_path"
+        )
+
+    output_path = Path(output_path_str)
+    ensure_dir(str(output_path.parent) if str(output_path.parent) else ".")
+    tokenizer, model = load_model(model_path, base_model, offload_dir)
     eval_data = load_data(cfg)
+    valid_ids = {item["instance_id"] for item in eval_data}
 
-    output_path = Path(cfg["output_file"])
     done_ids = set()
     if output_path.exists():
         done = read_jsonl(str(output_path))
-        done_ids = {r["instance_id"] for r in done}
+        raw_done_ids = {r["instance_id"] for r in done if "instance_id" in r}
+        done_ids = raw_done_ids & valid_ids
         print(f"Resuming: {len(done_ids)} already done")
+        ignored = len(raw_done_ids) - len(done_ids)
+        if ignored > 0:
+            print(f"Ignored {ignored} done ids not in current eval set")
 
     print(f"\nStart generating ({len(eval_data)} samples)...")
 
@@ -288,11 +344,15 @@ def main():
     print(f"Remaining: {len(remaining)} / {total}")
 
     with open(output_path, "a", encoding="utf-8") as f:
-        for item in tqdm(
-            remaining, desc=f"Generating traces (done={len(done_ids)}/{total})"
-        ):
+        pbar = tqdm(
+            total=total,
+            initial=len(done_ids),
+            desc="Generating traces",
+            unit="sample",
+        )
+        for item in remaining:
             instance_id = item["instance_id"]
-
+            split = item.get("split", "unknown")
             try:
                 pred_trace = generate_trace(
                     tokenizer,
@@ -301,33 +361,30 @@ def main():
                     item["nl_doc"],
                     item["tool_names"],
                 )
-                print(f"\n[{instance_id}] {item['Name']}")
-                print(f"Q: {item['user_input']}")
-                print(f"Pred: {pred_trace}")
-                print("─" * 60)
-                row = {
-                    "Name": item["Name"],
-                    "instance_id": instance_id,
-                    "split": item["_split"],
-                    "input": item["user_input"],
-                    "gt_trace": item["gt_trace"],
-                    "pred_trace": pred_trace,
-                }
+                row = build_output_row(
+                    item["Name"],
+                    instance_id,
+                    split,
+                    item["user_input"],
+                    item["gt_trace"],
+                    pred_trace,
+                )
             except Exception as e:
                 print(f"Skip {instance_id}: {e}")
-                row = {
-                    "Name": item["Name"],
-                    "instance_id": instance_id,
-                    "split": item["_split"],
-                    "input": item["user_input"],
-                    "gt_trace": item["gt_trace"],
-                    "pred_trace": "",
-                }
-
+                row = build_output_row(
+                    item["Name"],
+                    instance_id,
+                    split,
+                    item["user_input"],
+                    item["gt_trace"],
+                    "",
+                )
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
+            pbar.update(1)
+        pbar.close()
 
-    print(f"\nSaved to: {cfg['output_file']}")
+    print(f"\nSaved to: {output_path_str}")
 
     del model
     torch.cuda.empty_cache()

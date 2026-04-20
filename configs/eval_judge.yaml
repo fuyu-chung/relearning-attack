@@ -1,0 +1,6 @@
+# eval_judge.py
+input_path: out/generated_traces_ratio_2_0.jsonl
+judge_model_path: meta-llama/Meta-Llama-3.1-8B-Instruct
+results_path: out/judge_results_ratio_2_0.jsonl
+false_reasons_path: out/judge_false_reasons_ratio_2_0.jsonl
+summary_path: out/evaluation_summary_ratio_2_0.json

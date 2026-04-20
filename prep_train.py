@@ -74,7 +74,7 @@ def flatten_tools(
 ) -> List[Dict[str, Any]]:
     flat = []
     used_ids = set()
-    name_max_idx = {}  # 記錄每個工具目前最大的 index
+    name_max_idx = {}
 
     for t in tools:
         name = t.get("Name", "")
@@ -98,7 +98,6 @@ def flatten_tools(
                 used_ids.add(instance_id)
                 name_max_idx[name] = max(name_max_idx.get(name, -1), i)
             else:
-                # 接在目前最大 index 後面
                 next_idx = name_max_idx.get(name, i) + 1
                 instance_id = f"{name}_{next_idx}"
                 used_ids.add(instance_id)
@@ -117,68 +116,77 @@ def flatten_tools(
                 }
             )
 
-    # 把同工具的 instance 排在一起，按 index 數字排序，工具間保持原始順序
-    import re
-
-    tool_order = []
-    tool_groups = {}
-    for r in flat:
-        name = r["Name"]
-        if name not in tool_groups:
-            tool_order.append(name)
-            tool_groups[name] = []
-        tool_groups[name].append(r)
-
-    def get_index(r):
-        m = re.search(r"_(\d+)$", r["instance_id"])
-        return int(m.group(1)) if m else 0
-
-    flat = [r for name in tool_order for r in sorted(tool_groups[name], key=get_index)]
-
     return flat
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="configs/base.yaml")
+    ap.add_argument("--config", default="configs/prep.yaml")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
 
-    forget_ratio = cfg["forget_ratio"]
+    prep_cfg = cfg.get("prep_train") if isinstance(cfg, dict) else None
+    if not isinstance(prep_cfg, dict):
+        raise ValueError("Missing prep_train section in config")
 
-    ensure_dir(cfg["out_dir"])
-    tools = read_json(cfg["in_json"])
+    required_keys = [
+        "input_path",
+        "forget_ratio",
+        "flat_instances_path",
+        "split_tools_path",
+        "forget_output_path",
+        "retain_output_path",
+    ]
+    missing = [k for k in required_keys if prep_cfg.get(k) is None]
+    if missing:
+        raise ValueError(f"Missing prep_train config: {', '.join(missing)}")
+
+    in_json = prep_cfg["input_path"]
+    forget_ratio = prep_cfg["forget_ratio"]
+    max_train_tools = prep_cfg.get("max_tools")
+    seed = 42
+    flat_instances_path = prep_cfg["flat_instances_path"]
+    split_tools_path = prep_cfg["split_tools_path"]
+    forget_output_path = prep_cfg["forget_output_path"]
+    retain_output_path = prep_cfg["retain_output_path"]
+
+    for p in [
+        flat_instances_path,
+        split_tools_path,
+        forget_output_path,
+        retain_output_path,
+    ]:
+        ensure_dir(os.path.dirname(p) or ".")
+
+    random.seed(seed)
+
+    tools = read_json(in_json)
     if not isinstance(tools, list):
         raise ValueError("Expected a list of tools in the input JSON.")
 
-    # 先存全部工具的 instances（不 print 重複）
-    flat_all = flatten_tools(tools, verbose=False)
-    all_tool_names = sorted({r["Name"] for r in flat_all if r["Name"]})
-    write_jsonl(os.path.join(cfg["out_dir"], "flat_instances.jsonl"), flat_all)
-    print(
-        f"Saved flat_instances.jsonl: {len(all_tool_names)}/{len(flat_all)} tools/instances"
-    )
+    tools_for_flat = tools[:max_train_tools] if max_train_tools else tools
+    flat = flatten_tools(tools_for_flat, verbose=True)
+    all_tool_names = sorted({r["Name"] for r in flat if r["Name"]})
+    write_jsonl(flat_instances_path, flat)
 
-    # 限制 train 工具數
-    max_train_tools = cfg.get("max_train_tools", None)
     if max_train_tools:
-        tools = tools[:max_train_tools]
         print(f"Limiting to {max_train_tools} tools")
 
-    flat = flatten_tools(tools, verbose=True)
+    print(
+        f"Saved {flat_instances_path}: {len(all_tool_names)}/{len(flat)} tools/instances"
+    )
 
-    tool_names = sorted({r["Name"] for r in flat if r["Name"]})
-    rnd = random.Random(42)
-    rnd.shuffle(tool_names)
+    tool_names = all_tool_names
+    random.shuffle(tool_names)
     k = max(1, int(len(tool_names) * forget_ratio))
     tf_tools = set(tool_names[:k])
     tr_tools = set(tool_names[k:])
 
     write_json(
-        os.path.join(cfg["out_dir"], "split_tools.json"),
+        split_tools_path,
         {
-            "seed": 42,
+            "seed": seed,
             "forget_ratio": forget_ratio,
             "num_tools": len(tool_names),
             "tf_tools": sorted(tf_tools),
@@ -189,12 +197,12 @@ def main():
     forget_rows = [r for r in flat if r["Name"] in tf_tools]
     retain_rows = [r for r in flat if r["Name"] in tr_tools]
 
-    write_jsonl(os.path.join(cfg["out_dir"], "forget_sft.jsonl"), forget_rows)
-    write_jsonl(os.path.join(cfg["out_dir"], "retain_sft.jsonl"), retain_rows)
+    write_jsonl(forget_output_path, forget_rows)
+    write_jsonl(retain_output_path, retain_rows)
 
-    print(f"Total flattened tools/instances: {len(tool_names)}/{len(flat)}")
-    print(f"Forget tools/instances: {len(tf_tools)}/{len(forget_rows)}")
-    print(f"Retain tools/instances: {len(tr_tools)}/{len(retain_rows)}")
+    print(
+        f"Forget tools/instances: {len(tf_tools)}/{len(forget_rows)} | Retain tools/instances: {len(tr_tools)}/{len(retain_rows)}"
+    )
 
 
 if __name__ == "__main__":

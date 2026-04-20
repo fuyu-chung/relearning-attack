@@ -6,7 +6,7 @@ from argparse import ArgumentParser
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from utils.io_utils import read_jsonl, write_jsonl
+from utils.io_utils import read_jsonl
 
 
 YPRIME_PROMPT = """\
@@ -86,19 +86,52 @@ def generate_yprime(
     return clean_yprime(answer)
 
 
+def build_yprime_row(
+    tool_name: str, instance_id: str, messages: list, answer: str
+) -> dict:
+    return {
+        "Name": tool_name,
+        "instance_id": instance_id,
+        "messages": messages,
+        "y_prime": answer,
+    }
+
+
 def main():
     ap = ArgumentParser()
-    ap.add_argument("--config", default="configs/base.yaml")
+    ap.add_argument("--config", default="configs/gen_yprime.yaml")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
 
-    data = read_jsonl(cfg["forget_sft"])
-    print(f"Loaded {len(data)} instances from {cfg['forget_sft']}")
+    legacy_map = {
+        "forget_data_path": "forget_sft",
+        "generation_model_path": "model_path",
+        "output_path": "yprime_out",
+        "generation_max_new_tokens": "max_new_tokens",
+    }
+    for new_key, old_key in legacy_map.items():
+        if new_key not in cfg and old_key in cfg:
+            print(f"[config] '{old_key}' is legacy; prefer '{new_key}'.")
 
-    tokenizer, model = load_model(cfg["model_path"])
+    forget_data_path = cfg.get("forget_data_path") or cfg.get("forget_sft")
+    model_path = cfg.get("generation_model_path") or cfg.get("model_path")
+    output_path = cfg.get("output_path") or cfg.get("yprime_out")
+    max_new_tokens = int(
+        cfg.get("generation_max_new_tokens") or cfg.get("max_new_tokens") or 256
+    )
 
-    output_path = cfg["yprime_out"]
+    required = [forget_data_path, model_path, output_path]
+    if not all(required):
+        raise ValueError(
+            "Need forget_data_path/generation_model_path/output_path (or legacy forget_sft/model_path/yprime_out)"
+        )
+
+    data = read_jsonl(forget_data_path)
+    print(f"Loaded {len(data)} instances from {forget_data_path}")
+
+    tokenizer, model = load_model(model_path)
+
     done_ids = set()
     if os.path.exists(output_path):
         done = read_jsonl(output_path)
@@ -110,7 +143,9 @@ def main():
     success = skipped = 0
 
     with open(output_path, "a", encoding="utf-8") as f:
-        for inst in tqdm(data, desc="Generating Y'"):
+        for _, inst in enumerate(
+            tqdm(data, desc="Generating Y' (progress)", unit="sample", ncols=100)
+        ):
             instance_id = inst.get("instance_id", "")
             if instance_id in done_ids:
                 continue
@@ -125,38 +160,32 @@ def main():
 
             try:
                 answer = generate_yprime(
-                    model, tokenizer, question, tool_name, cfg["max_new_tokens"]
+                    model, tokenizer, question, tool_name, max_new_tokens
                 )
-                row = {
-                    "Name": tool_name,
-                    "instance_id": instance_id,
-                    "messages": [
-                        {"role": "user", "content": question},
-                        {"role": "assistant", "content": answer},
-                    ],
-                    "y_prime": answer,
-                }
-                if answer:
-                    success += 1
-                else:
-                    skipped += 1
             except Exception as e:
                 print(f"Skip {instance_id}: {e}")
-                row = {
-                    "Name": tool_name,
-                    "instance_id": instance_id,
-                    "messages": inst.get("messages", []),
-                    "y_prime": "",
-                }
+                answer = ""
+
+            if answer:
+                success += 1
+            else:
                 skipped += 1
+            row = build_yprime_row(
+                tool_name,
+                instance_id,
+                [
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": answer},
+                ],
+                answer,
+            )
 
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
 
-    print(f"Total:   {len(data)}")
-    print(f"Success: {success}")
-    print(f"Skipped: {skipped}")
-    print(f"Saved to: {output_path}")
+    print(
+        f"Total: {len(data)} | Success: {success} | Skipped: {skipped} | Saved to: {output_path}"
+    )
 
 
 if __name__ == "__main__":

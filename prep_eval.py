@@ -54,6 +54,26 @@ def get_tool_names(nl_doc: str) -> str:
     return ", ".join(names) if names else ""
 
 
+def build_eval_row(
+    name: str,
+    instance_id: str,
+    nl_doc: str,
+    tool_names: str,
+    instruction: str,
+    gt_trace: str,
+) -> dict:
+    return {
+        "Name": name,
+        "instance_id": instance_id,
+        "nl_doc": nl_doc,
+        "tool_names": tool_names,
+        "messages": [
+            {"role": "user", "content": instruction},
+            {"role": "assistant", "content": gt_trace},
+        ],
+    }
+
+
 def flatten_eval(tools: list) -> list:
     rows = []
     for tool in tools:
@@ -70,16 +90,14 @@ def flatten_eval(tools: list) -> list:
                 continue
 
             rows.append(
-                {
-                    "Name": name,
-                    "instance_id": f"{name}_{i}",
-                    "nl_doc": nl_doc,
-                    "tool_names": tool_names,
-                    "messages": [
-                        {"role": "user", "content": instruction.strip()},
-                        {"role": "assistant", "content": gt_trace},
-                    ],
-                }
+                build_eval_row(
+                    name,
+                    f"{name}_{i}",
+                    nl_doc,
+                    tool_names,
+                    instruction.strip(),
+                    gt_trace,
+                )
             )
 
     return rows
@@ -87,19 +105,31 @@ def flatten_eval(tools: list) -> list:
 
 def main():
     ap = ArgumentParser()
-    ap.add_argument("--config", default="configs/base.yaml")
+    ap.add_argument("--config", default="configs/prep.yaml")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
 
-    tools = read_json(cfg["eval_raw"])
+    eval_cfg = cfg.get("prep_eval") if isinstance(cfg, dict) else None
+    if not isinstance(eval_cfg, dict):
+        raise ValueError("Missing prep_eval section in config")
+
+    required_keys = ["input_path", "output_path"]
+    missing = [k for k in required_keys if eval_cfg.get(k) is None]
+    if missing:
+        raise ValueError(f"Missing prep_eval config: {', '.join(missing)}")
+
+    eval_raw = eval_cfg["input_path"]
+    eval_file = eval_cfg["output_path"]
+
+    tools = read_json(eval_raw)
     if not isinstance(tools, list):
         raise ValueError("Expected a list of tools in the input JSON.")
 
     rows = flatten_eval(tools)
-    write_jsonl(cfg["eval_file"], rows)
+    write_jsonl(eval_file, rows)
 
-    print(f"Total tools/instances: {len(tools)}/{len(rows)}")
+    print(f"Saved {eval_file}: {len(rows)} instances from {len(tools)} tools")
 
 
 if __name__ == "__main__":

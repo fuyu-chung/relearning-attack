@@ -1,0 +1,5 @@
+# gen_yprime.py
+forget_data_path: out/forget_sft.jsonl
+output_path: out/forget_yprime.jsonl
+generation_model_path: lmsys/vicuna-7b-v1.3
+generation_max_new_tokens: 256

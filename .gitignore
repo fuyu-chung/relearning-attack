@@ -1,5 +1,10 @@
 data/
+out/
 .vscode/
+tooldelete_sft_model_ratio_2_0/
+trash/
+
+*.pdf
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
