@@ -1,83 +1,18 @@
 import json
 import re
-import yaml
 import torch
 from argparse import ArgumentParser
 from pathlib import Path
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import PeftModel
 
-from utils.io_utils import ensure_dir, read_json, read_jsonl
-
-
-def load_config(path: str) -> dict:
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def load_model(
-    model_name: str, base_model: str | None = None, offload_dir: str | None = None
-):
-    model_path = Path(model_name)
-    if offload_dir:
-        ensure_dir(offload_dir)
-    is_adapter_dir = (
-        model_path.is_dir() and (model_path / "adapter_config.json").exists()
-    )
-
-    # LoRA adapter dirs do not contain config.json for AutoModel; load base then attach adapter.
-    if is_adapter_dir:
-        adapter_cfg = read_json(str(model_path / "adapter_config.json"))
-        resolved_base = base_model or adapter_cfg.get("base_model_name_or_path")
-        if not resolved_base:
-            raise ValueError(
-                f"Adapter path {model_name} requires base model. Set base_model in config."
-            )
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            use_fast=False,
-            local_files_only=True,
-            legacy=True,
-        )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        base = AutoModelForCausalLM.from_pretrained(
-            resolved_base,
-            device_map="auto",
-            torch_dtype=torch.float16,
-            local_files_only=True,
-            offload_folder=offload_dir,
-        )
-        model = PeftModel.from_pretrained(
-            base,
-            model_name,
-            local_files_only=True,
-            offload_folder=offload_dir,
-        )
-        model.eval()
-        return tokenizer, model
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        use_fast=False,
-        local_files_only=True,
-        legacy=True,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        torch_dtype=torch.float16,
-        local_files_only=True,
-        offload_folder=offload_dir,
-    )
-    model.eval()
-    return tokenizer, model
+from utils.io_utils import (
+    ensure_dir,
+    read_json,
+    read_jsonl,
+    load_config,
+    load_model,
+    safe_str,
+)
 
 
 def get_tool_names(nl_doc: str) -> str:
@@ -88,17 +23,6 @@ def get_tool_names(nl_doc: str) -> str:
         if m not in _SKIP
     ]
     return ", ".join(names) if names else ""
-
-
-def safe_str(x) -> str:
-    if x is None:
-        return ""
-    if isinstance(x, str):
-        return x
-    try:
-        return json.dumps(x, ensure_ascii=False)
-    except Exception:
-        return str(x)
 
 
 def serialize_golden(actions: list) -> str:
@@ -307,19 +231,26 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    model_path = (
-        cfg.get("model_path")
-        or cfg.get("adapter_model_path")
-        or cfg.get("base_model_path")
-    )
+    model_path = cfg.get("model_path")
+    if not model_path and "adapter_model_path" in cfg:
+        print("[config] 'adapter_model_path' is legacy; prefer 'model_path'.")
+        model_path = cfg.get("adapter_model_path")
+    if not model_path and "base_model_path" in cfg:
+        print("[config] 'base_model_path' is legacy; prefer 'model_path'.")
+        model_path = cfg.get("base_model_path")
+    if not model_path:
+        raise ValueError(
+            "Need model_path (or legacy adapter_model_path/base_model_path)"
+        )
+
     base_model = cfg.get("base_model_path")
     offload_dir = cfg.get("offload_dir")
-    output_path_str = cfg.get("output_path")
-
-    if not model_path or not output_path_str:
-        raise ValueError(
-            "Need model_path (or adapter_model_path / base_model_path), and output_path"
-        )
+    output_path_str = cfg.get("output_dir")
+    if not output_path_str and "output_path" in cfg:
+        print("[config] 'output_path' is legacy; prefer 'output_dir'.")
+        output_path_str = cfg.get("output_path")
+    if not output_path_str:
+        raise ValueError("Need output_dir (or legacy output_path)")
 
     output_path = Path(output_path_str)
     ensure_dir(str(output_path.parent) if str(output_path.parent) else ".")

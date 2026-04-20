@@ -1,12 +1,10 @@
 import json
 import os
-import yaml
 import torch
 from argparse import ArgumentParser
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from utils.io_utils import read_jsonl
+from utils.io_utils import read_jsonl, load_config, load_model
 
 
 YPRIME_PROMPT = """\
@@ -27,31 +25,6 @@ Answer:"""
 
 
 _TOOL_LEAK = ["<call", "action input", "function(", "observation:"]
-
-
-def load_config(path: str) -> dict:
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def load_model(model_path: str):
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        use_fast=False,
-        local_files_only=True,
-        legacy=True,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        device_map="auto",
-        torch_dtype=torch.float16,
-        local_files_only=True,
-    )
-    model.eval()
-    return tokenizer, model
 
 
 def clean_yprime(answer: str) -> str:
@@ -114,9 +87,23 @@ def main():
         if new_key not in cfg and old_key in cfg:
             print(f"[config] '{old_key}' is legacy; prefer '{new_key}'.")
 
-    forget_data_path = cfg.get("forget_data_path") or cfg.get("forget_sft")
-    model_path = cfg.get("generation_model_path") or cfg.get("model_path")
-    output_path = cfg.get("output_path") or cfg.get("yprime_out")
+    forget_data_path = cfg.get("forget_data_path")
+    if not forget_data_path and "forget_sft" in cfg:
+        print("[config] 'forget_sft' is legacy; prefer 'forget_data_path'.")
+        forget_data_path = cfg.get("forget_sft")
+    model_path = cfg.get("model_path")
+    if not model_path and "generation_model_path" in cfg:
+        print("[config] 'generation_model_path' is legacy; prefer 'model_path'.")
+        model_path = cfg.get("generation_model_path")
+    if not model_path and "model_path" in cfg:
+        model_path = cfg.get("model_path")
+    output_path = cfg.get("output_dir")
+    if not output_path and "output_path" in cfg:
+        print("[config] 'output_path' is legacy; prefer 'output_dir'.")
+        output_path = cfg.get("output_path")
+    if not output_path and "yprime_out" in cfg:
+        print("[config] 'yprime_out' is legacy; prefer 'output_dir'.")
+        output_path = cfg.get("yprime_out")
     max_new_tokens = int(
         cfg.get("generation_max_new_tokens") or cfg.get("max_new_tokens") or 256
     )
@@ -183,10 +170,4 @@ def main():
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
 
-    print(
         f"Total: {len(data)} | Success: {success} | Skipped: {skipped} | Saved to: {output_path}"
-    )
-
-
-if __name__ == "__main__":
-    main()

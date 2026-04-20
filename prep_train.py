@@ -1,27 +1,16 @@
 import argparse
-import json
 import os
 import random
-import yaml
 from typing import Any, Dict, List, Tuple
 
-from utils.io_utils import ensure_dir, read_json, write_json, write_jsonl
-
-
-def load_config(path: str) -> Dict[str, Any]:
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def safe_str(x: Any) -> str:
-    if x is None:
-        return ""
-    if isinstance(x, str):
-        return x
-    try:
-        return json.dumps(x, ensure_ascii=False)
-    except Exception:
-        return str(x)
+from utils.io_utils import (
+    ensure_dir,
+    read_json,
+    write_json,
+    write_jsonl,
+    load_config,
+    safe_str,
+)
 
 
 def parse_intermediate_steps(steps: Any) -> List[Tuple[str, str, str, str]]:

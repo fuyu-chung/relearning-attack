@@ -1,7 +1,6 @@
 import argparse
 import os
 import random
-import yaml
 import torch
 
 from collections import defaultdict
@@ -17,11 +16,7 @@ from transformers import (
 from trl import SFTTrainer
 from peft import LoraConfig
 from utils import io_utils
-
-
-def load_config(path: str) -> dict:
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+from utils.io_utils import load_config
 
 
 def normalize_suffix(raw_suffix: Optional[str]) -> str:
@@ -52,10 +47,6 @@ def validate_input_file(path: str, label: str) -> None:
     if not os.path.exists(path):
         raise FileNotFoundError(f"{label} not found: {path}")
 
-
-def cleanup_cuda() -> None:
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
 
 def save_model_bundle(model, tokenizer, output_dir: str) -> None:
@@ -258,7 +249,7 @@ def ensure_random_model(model_path: str, output_path: str, seed: int = 42) -> st
     random_model.save_pretrained(output_path)
     print(f"✓ Random model saved to {output_path}")
     del random_model
-    cleanup_cuda()
+    torch.cuda.empty_cache()
     return output_path
 
 
@@ -307,40 +298,11 @@ def apply_task_arithmetic(
                 param.data.add_(delta, alpha=alpha)
                 del delta
     del theta0, theta0_params, thetaR, thetaR_params
-    cleanup_cuda()
+    torch.cuda.empty_cache()
     return trained_model
 
 
-def parse_args():
-    ap = argparse.ArgumentParser(description="TOOLDELETE-SFT")
-    ap.add_argument("--config", default="configs/train.yaml")
-    ap.add_argument(
-        "--suffix",
-        default=None,
-        help="Append suffix to model output dir, e.g. ratio_2_0 -> *_ratio_2_0",
-    )
-    ap.add_argument(
-        "--retain_ratio",
-        type=float,
-        default=None,
-        help="Override retain ratio for this run.",
-    )
-    ap.add_argument(
-        "--model_output_dir",
-        default=None,
-        help="Override output dir for this run.",
-    )
-    ap.add_argument(
-        "--forget_data_path",
-        default=None,
-        help="Override forget training jsonl path.",
-    )
-    ap.add_argument(
-        "--retain_data_path",
-        default=None,
-        help="Override retain training jsonl path.",
-    )
-    return ap.parse_args()
+
 
 
 def main():
@@ -353,28 +315,44 @@ def main():
         args.suffix if args.suffix is not None else cfg.get("path_suffix")
     )
 
-    out_root = cfg.get("output_dir", cfg.get("out_dir", "out"))
+    out_root = cfg.get("output_dir")
+    if not out_root and "out_dir" in cfg:
+        print("[config] 'out_dir' is legacy; prefer 'output_dir'.")
+        out_root = cfg.get("out_dir")
+    if not out_root:
+        out_root = "out"
     forget_jsonl = cfg.get(
         "forget_data_path", cfg.get("forget_yprime", "out/forget_yprime.jsonl")
     )
     retain_jsonl = cfg.get(
         "retain_data_path", cfg.get("retain_sft", "out/retain_sft.jsonl")
     )
-    model_path = cfg.get(
-        "train_model_path",
-        cfg.get(
-            "base_model_path",
-            cfg.get(
-                "base_model",
-                cfg.get("toolalpaca_model", "TangQiaoYu/ToolAlpaca-7B"),
-            ),
-        ),
-    )
-    base_model = cfg.get("base_model_path", cfg.get("base_model", None))
+    model_path = cfg.get("model_path")
+    if not model_path and "train_model_path" in cfg:
+        print("[config] 'train_model_path' is legacy; prefer 'model_path'.")
+        model_path = cfg.get("train_model_path")
+    if not model_path and "base_model_path" in cfg:
+        print("[config] 'base_model_path' is legacy; prefer 'model_path'.")
+        model_path = cfg.get("base_model_path")
+    if not model_path and "base_model" in cfg:
+        print("[config] 'base_model' is legacy; prefer 'model_path'.")
+        model_path = cfg.get("base_model")
+    if not model_path and "toolalpaca_model" in cfg:
+        print("[config] 'toolalpaca_model' is legacy; prefer 'model_path'.")
+        model_path = cfg.get("toolalpaca_model")
+    if not model_path:
+        model_path = "TangQiaoYu/ToolAlpaca-7B"
+    base_model = None  # 若有需要可再補 legacy fallback
     random_model = cfg.get("random_model_path", cfg.get("random_model", None))
-    output_dir = cfg.get(
-        "model_output_dir", cfg.get("tooldelete_sft_model_dir")
-    ) or os.path.join(out_root, "tooldelete_sft_model")
+    output_dir = cfg.get("output_dir")
+    if not output_dir and "model_output_dir" in cfg:
+        print("[config] 'model_output_dir' is legacy; prefer 'output_dir'.")
+        output_dir = cfg.get("model_output_dir")
+    if not output_dir and "tooldelete_sft_model_dir" in cfg:
+        print("[config] 'tooldelete_sft_model_dir' is legacy; prefer 'output_dir'.")
+        output_dir = cfg.get("tooldelete_sft_model_dir")
+    if not output_dir:
+        output_dir = os.path.join(out_root, "tooldelete_sft_model")
 
     if args.forget_data_path:
         forget_jsonl = args.forget_data_path
@@ -492,7 +470,7 @@ def main():
     print(f"Final model saved: {final_dir}")
 
     del model
-    cleanup_cuda()
+    torch.cuda.empty_cache()
     print("Done")
 
 

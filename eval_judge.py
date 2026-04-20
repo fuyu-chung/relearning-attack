@@ -1,6 +1,5 @@
 import re
 import json
-import yaml
 import numpy as np
 import torch
 import pandas as pd
@@ -9,12 +8,7 @@ from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
-from utils.io_utils import ensure_dir, read_jsonl, write_json
-
-
-def load_config(path: str) -> dict:
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+from utils.io_utils import ensure_dir, read_jsonl, write_json, load_config
 
 
 def load_judge(model_name: str):
@@ -56,7 +50,6 @@ def strip_observation(trace: str) -> str:
 
 
 def strip_duplicate_actions(trace: str) -> str:
-    """移除 gt_trace 裡連續重複的 Action + Action Input 區塊"""
     lines = trace.split("\n")
     cleaned = []
     i = 0
@@ -132,11 +125,6 @@ def judge_tool_use(
     return correct, new_text
 
 
-
-
-
-
-
 def main():
     ap = ArgumentParser()
     ap.add_argument("--config", default="configs/eval_judge.yaml")
@@ -148,22 +136,33 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    out_dir = cfg.get("output_dir", cfg.get("out_dir", "out"))
+    out_dir = cfg.get("output_dir")
+    if not out_dir and "out_dir" in cfg:
+        print("[config] 'out_dir' is legacy; prefer 'output_dir'.")
+        out_dir = cfg.get("out_dir")
+    if not out_dir:
+        out_dir = "out"
     ensure_dir(out_dir)
 
     judge_output_dir = cfg.get("judge_output_dir", out_dir)
     scores_filename = cfg.get("judge_results_file", "eval_scores.jsonl")
-    false_reasons_filename = cfg.get("judge_false_reasons_file", "eval_false_reasons.jsonl")
+    false_reasons_filename = cfg.get(
+        "judge_false_reasons_file", "eval_false_reasons.jsonl"
+    )
     summary_filename = cfg.get("judge_summary_file", "evaluation_summary.json")
 
-    scores_path = Path(cfg.get("results_path", str(Path(judge_output_dir) / scores_filename)))
+    scores_path = Path(
+        cfg.get("results_path", str(Path(judge_output_dir) / scores_filename))
+    )
     false_reasons_path = Path(
         cfg.get(
             "false_reasons_path",
             str(Path(judge_output_dir) / false_reasons_filename),
         )
     )
-    summary_path = Path(cfg.get("summary_path", str(Path(judge_output_dir) / summary_filename)))
+    summary_path = Path(
+        cfg.get("summary_path", str(Path(judge_output_dir) / summary_filename))
+    )
 
     ensure_dir(str(scores_path.parent))
     ensure_dir(str(false_reasons_path.parent))
@@ -189,9 +188,15 @@ def main():
 
         valid_ids = {item["instance_id"] for item in traces}
 
-        judge_model = cfg.get("judge_model_path", cfg.get("judge_model"))
+        judge_model = cfg.get("model_path")
+        if not judge_model and "judge_model_path" in cfg:
+            print("[config] 'judge_model_path' is legacy; prefer 'model_path'.")
+            judge_model = cfg.get("judge_model_path")
+        if not judge_model and "judge_model" in cfg:
+            print("[config] 'judge_model' is legacy; prefer 'model_path'.")
+            judge_model = cfg.get("judge_model")
         if not judge_model:
-            raise ValueError("Need judge_model_path (or legacy judge_model)")
+            raise ValueError("Need model_path (or legacy judge_model_path/judge_model)")
         judge_pipe = load_judge(judge_model)
 
         done_ids = set()
@@ -272,7 +277,7 @@ def main():
     n_test = int((df["split"] == "test").sum())
     n_forget = int((df["split"] == "forget").sum())
     n_retain = int((df["split"] == "retain").sum())
-    
+
     Tt = df[df["split"] == "test"]["used_tool"].mean()
     Tf = df[df["split"] == "forget"]["used_tool"].mean()
     Tr = df[df["split"] == "retain"]["used_tool"].mean()
@@ -287,11 +292,15 @@ def main():
     print(f"{'Metric':<8} {'Score':<12} {'Baseline':<12} {'Sample Count':<15}")
     print("-" * 70)
     print(f"{'Tt':<8} {Tt:<12.3f} {'60.0':<12} {t_correct}/{n_test} ({Tt*100:6.2f}%)")
-    print(f"{'Tf':<8} {Tf:<12.3f} {'75.7':<12} {f_correct}/{n_forget} ({Tf*100 if not np.isnan(Tf) else 0:6.2f}%)")
+    print(
+        f"{'Tf':<8} {Tf:<12.3f} {'75.7':<12} {f_correct}/{n_forget} ({Tf*100 if not np.isnan(Tf) else 0:6.2f}%)"
+    )
     if np.isnan(Tr):
         print(f"{'Tr':<8} {'N/A':<12} {'73.1':<12} {r_correct}/{n_retain} (no data)")
     else:
-        print(f"{'Tr':<8} {Tr:<12.3f} {'73.1':<12} {r_correct}/{n_retain} ({Tr*100:6.2f}%)")
+        print(
+            f"{'Tr':<8} {Tr:<12.3f} {'73.1':<12} {r_correct}/{n_retain} ({Tr*100:6.2f}%)"
+        )
     print("=" * 70)
 
     write_json(
