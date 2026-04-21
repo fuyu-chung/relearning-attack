@@ -1,100 +1,155 @@
-def safe_str(x) -> str:
-    if x is None:
-        return ""
-    if isinstance(x, str):
-        return x
-    try:
-        return json.dumps(x, ensure_ascii=False)
-    except Exception:
-        return str(x)
-import torch
-from pathlib import Path
-from transformers import AutoTokenizer, AutoModelForCausalLM
-try:
-    from peft import PeftModel
-except ImportError:
-    PeftModel = None
+"""
+io_utils.py — shared I/O helpers for all pipeline modules.
 
-def load_model(model_path: str, base_model: str = None, offload_dir: str = None):
-    """統一模型載入，支援 LoRA/adapter 與一般模型。"""
-    model_path = Path(model_path)
-    if offload_dir:
-        ensure_dir(offload_dir)
-    is_adapter_dir = model_path.is_dir() and (model_path / "adapter_config.json").exists()
-    if is_adapter_dir and PeftModel is not None:
-        from utils.io_utils import read_json
-        adapter_cfg = read_json(str(model_path / "adapter_config.json"))
-        resolved_base = base_model or adapter_cfg.get("base_model_name_or_path")
-        if not resolved_base:
-            raise ValueError(f"Adapter path {model_path} requires base model. Set base_model in config.")
-        tokenizer = AutoTokenizer.from_pretrained(
-            str(model_path), use_fast=False, local_files_only=True, legacy=True
-        )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        base = AutoModelForCausalLM.from_pretrained(
-            resolved_base,
-            device_map="auto",
-            torch_dtype=torch.float16,
-            local_files_only=True,
-            offload_folder=offload_dir,
-        )
-        model = PeftModel.from_pretrained(
-            base,
-            str(model_path),
-            local_files_only=True,
-            offload_folder=offload_dir,
-        )
-        model.eval()
-        return tokenizer, model
-    # 一般模型
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(model_path), use_fast=False, local_files_only=True, legacy=True
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(
-        str(model_path),
-        device_map="auto",
-        torch_dtype=torch.float16,
-        local_files_only=True,
-        offload_folder=offload_dir,
-    )
-    model.eval()
-    return tokenizer, model
-import yaml
+New helpers (items 1 & 5):
+  - resolve_config_key : unified config key resolution with legacy fallback
+  - get_done_ids       : resume logic (collect already-processed instance_ids)
+"""
 
-def load_config(path: str):
-    """讀取 yaml 或 json 設定檔，根據副檔名自動判斷格式。"""
-    if path.endswith(".json") or path.endswith(".jsonl"):
-        return read_json(path)
-    with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+from __future__ import annotations
+
 import json
 import os
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Optional
+
+import torch
+import yaml
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-def ensure_dir(p: str):
-    os.makedirs(p, exist_ok=True)
+def resolve_config_key(
+    cfg: dict,
+    primary: str,
+    *legacy_keys: str,
+    required: bool = True,
+    default: Any = None,
+) -> Any:
+    """Return cfg[primary], falling back to legacy_keys in order.
+
+    Prints a deprecation warning for each legacy key that is hit.
+    Raises ValueError if required=True and nothing is found.
+    """
+    if primary in cfg:
+        return cfg[primary]
+    for key in legacy_keys:
+        if key in cfg:
+            print(f"[config] '{key}' is legacy; prefer '{primary}'.")
+            return cfg[key]
+    if required and default is None:
+        raise ValueError(
+            f"Config missing required key '{primary}'"
+            + (f" (also tried: {', '.join(legacy_keys)})" if legacy_keys else "")
+        )
+    return default
 
 
-def read_json(path: str):
+def get_done_ids(output_path: str | Path, valid_ids: Optional[set] = None) -> set:
+    """Return the set of instance_ids already written to *output_path*.
+
+    If *valid_ids* is given, only ids that appear in that set are returned
+    (stale ids from a previous run with a different eval set are ignored).
+    """
+    p = Path(output_path)
+    if not p.exists():
+        return set()
+    done = read_jsonl(str(p))
+    ids = {r["instance_id"] for r in done if "instance_id" in r}
+    if valid_ids is not None:
+        ignored = ids - valid_ids
+        if ignored:
+            print(f"Ignored {len(ignored)} stale done-ids not in current eval set")
+        ids &= valid_ids
+    print(f"Resuming: {len(ids)} already done")
+    return ids
+
+
+def ensure_dir(path: str) -> None:
+    if path:
+        os.makedirs(path, exist_ok=True)
+
+
+def read_json(path: str) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def write_json(path: str, obj: Any):
+def write_json(path: str, data: Any) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def read_jsonl(path: str) -> List[Dict[str, Any]]:
+def read_jsonl(path: str) -> list:
+    rows = []
     with open(path, "r", encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
 
 
-def write_jsonl(path: str, rows: List[Dict[str, Any]]):
+def write_jsonl(path: str, data: list) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
     with open(path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        for row in data:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def safe_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def load_model(
+    model_path: str,
+    base_model_path: Optional[str] = None,
+    offload_dir: Optional[str] = None,
+    local_files_only: bool = True,
+):
+    """Load tokenizer + model.
+
+    If *base_model_path* is provided, treat *model_path* as a PEFT/LoRA
+    adapter on top of *base_model_path*; otherwise load *model_path* as a
+    full model.
+    """
+    hf_kw: dict = {"local_files_only": local_files_only}
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_path or model_path,
+        use_fast=False,
+        legacy=True,
+        **hf_kw,
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    load_kw: dict = {
+        "torch_dtype": torch.float16,
+        "low_cpu_mem_usage": True,
+        **hf_kw,
+    }
+    if offload_dir:
+        load_kw["offload_folder"] = offload_dir
+        load_kw["device_map"] = "auto"
+    else:
+        load_kw["device_map"] = "auto"
+
+    if base_model_path:
+        base = AutoModelForCausalLM.from_pretrained(base_model_path, **load_kw)
+        model = PeftModel.from_pretrained(base, model_path, **hf_kw)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_path, **load_kw)
+
+    model.eval()
+    model.config.use_cache = False
+    return tokenizer, model

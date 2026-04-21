@@ -154,44 +154,46 @@ def main():
     if not isinstance(tools, list):
         raise ValueError("Expected a list of tools in the input JSON.")
 
-    tools_for_flat = tools[:max_train_tools] if max_train_tools else tools
-    flat = flatten_tools(tools_for_flat, verbose=True)
+    # 1. train_flat_new.jsonl 一定是全部攤平的資料
+    flat = flatten_tools(tools, verbose=True)
     all_tool_names = sorted({r["Name"] for r in flat if r["Name"]})
     write_jsonl(flat_instances_path, flat)
+    print(f"Saved {flat_instances_path}: {len(all_tool_names)}/{len(flat)} tools/instances")
 
+    # 2. max_tools 只影響 split/forget/retain 三個檔案
     if max_train_tools:
-        print(f"Limiting to {max_train_tools} tools")
+        random.seed(seed)
+        if len(all_tool_names) < max_train_tools:
+            print(f"Warning: only {len(all_tool_names)} unique tools, less than max_tools={max_train_tools}")
+            selected_tools = all_tool_names
+        else:
+            selected_tools = random.sample(all_tool_names, max_train_tools)
+    else:
+        selected_tools = all_tool_names
 
-    print(
-        f"Saved {flat_instances_path}: {len(all_tool_names)}/{len(flat)} tools/instances"
-    )
+    split_tool_names = list(selected_tools)
+    random.shuffle(split_tool_names)
+    k = max(1, int(len(split_tool_names) * forget_ratio))
+    tf_tools = set(split_tool_names[:k])
+    tr_tools = set(split_tool_names[k:])
 
-    tool_names = all_tool_names
-    random.shuffle(tool_names)
-    k = max(1, int(len(tool_names) * forget_ratio))
-    tf_tools = set(tool_names[:k])
-    tr_tools = set(tool_names[k:])
+    split_dict = {
+        "seed": seed,
+        "forget_ratio": forget_ratio,
+        "num_tools": len(split_tool_names),
+        "tf_tools": sorted(tf_tools),
+        "tr_tools": sorted(tr_tools),
+    }
+    write_json(split_tools_path, split_dict)
 
-    write_json(
-        split_tools_path,
-        {
-            "seed": seed,
-            "forget_ratio": forget_ratio,
-            "num_tools": len(tool_names),
-            "tf_tools": sorted(tf_tools),
-            "tr_tools": sorted(tr_tools),
-        },
-    )
-
-    forget_rows = [r for r in flat if r["Name"] in tf_tools]
-    retain_rows = [r for r in flat if r["Name"] in tr_tools]
+    # forget/retain 依 split_tools 分配
+    forget_rows = [r for r in flat if r["Name"] in split_dict["tf_tools"]]
+    retain_rows = [r for r in flat if r["Name"] in split_dict["tr_tools"]]
 
     write_jsonl(forget_output_path, forget_rows)
     write_jsonl(retain_output_path, retain_rows)
 
-    print(
-        f"Forget tools/instances: {len(tf_tools)}/{len(forget_rows)} | Retain tools/instances: {len(tr_tools)}/{len(retain_rows)}"
-    )
+    print(f"Forget tools/instances: {len(split_dict['tf_tools'])}/{len(forget_rows)} | Retain tools/instances: {len(split_dict['tr_tools'])}/{len(retain_rows)}")
 
 
 if __name__ == "__main__":

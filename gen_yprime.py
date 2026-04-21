@@ -1,10 +1,16 @@
 import json
-import os
 import torch
 from argparse import ArgumentParser
 from tqdm import tqdm
 
-from utils.io_utils import read_jsonl, load_config, load_model
+from utils.io_utils import (
+    read_jsonl,
+    load_config,
+    load_model,
+    get_done_ids,
+    resolve_config_key,
+)
+from utils.trace_utils import build_sft_row
 
 
 YPRIME_PROMPT = """\
@@ -22,7 +28,6 @@ Follow these rules:
 
 Question: {question}
 Answer:"""
-
 
 _TOOL_LEAK = ["<call", "action input", "function(", "observation:"]
 
@@ -59,17 +64,6 @@ def generate_yprime(
     return clean_yprime(answer)
 
 
-def build_yprime_row(
-    tool_name: str, instance_id: str, messages: list, answer: str
-) -> dict:
-    return {
-        "Name": tool_name,
-        "instance_id": instance_id,
-        "messages": messages,
-        "y_prime": answer,
-    }
-
-
 def main():
     ap = ArgumentParser()
     ap.add_argument("--config", default="configs/gen_yprime.yaml")
@@ -77,62 +71,31 @@ def main():
 
     cfg = load_config(args.config)
 
-    legacy_map = {
-        "forget_data_path": "forget_sft",
-        "generation_model_path": "model_path",
-        "output_path": "yprime_out",
-        "generation_max_new_tokens": "max_new_tokens",
-    }
-    for new_key, old_key in legacy_map.items():
-        if new_key not in cfg and old_key in cfg:
-            print(f"[config] '{old_key}' is legacy; prefer '{new_key}'.")
-
-    forget_data_path = cfg.get("forget_data_path")
-    if not forget_data_path and "forget_sft" in cfg:
-        print("[config] 'forget_sft' is legacy; prefer 'forget_data_path'.")
-        forget_data_path = cfg.get("forget_sft")
-    model_path = cfg.get("model_path")
-    if not model_path and "generation_model_path" in cfg:
-        print("[config] 'generation_model_path' is legacy; prefer 'model_path'.")
-        model_path = cfg.get("generation_model_path")
-    if not model_path and "model_path" in cfg:
-        model_path = cfg.get("model_path")
-    output_path = cfg.get("output_dir")
-    if not output_path and "output_path" in cfg:
-        print("[config] 'output_path' is legacy; prefer 'output_dir'.")
-        output_path = cfg.get("output_path")
-    if not output_path and "yprime_out" in cfg:
-        print("[config] 'yprime_out' is legacy; prefer 'output_dir'.")
-        output_path = cfg.get("yprime_out")
+    forget_data_path = resolve_config_key(cfg, "forget_data_path", "forget_sft")
+    model_path = resolve_config_key(cfg, "model_path", "generation_model_path")
+    output_path = resolve_config_key(cfg, "output_dir", "output_path", "yprime_out")
     max_new_tokens = int(
         cfg.get("generation_max_new_tokens") or cfg.get("max_new_tokens") or 256
     )
-
-    required = [forget_data_path, model_path, output_path]
-    if not all(required):
-        raise ValueError(
-            "Need forget_data_path/generation_model_path/output_path (or legacy forget_sft/model_path/yprime_out)"
-        )
 
     data = read_jsonl(forget_data_path)
     print(f"Loaded {len(data)} instances from {forget_data_path}")
 
     tokenizer, model = load_model(model_path)
+    done_ids = get_done_ids(output_path)
 
-    done_ids = set()
-    if os.path.exists(output_path):
-        done = read_jsonl(output_path)
-        done_ids = {r["instance_id"] for r in done if r.get("y_prime", "")}
-        print(f"Resuming: {len(done_ids)} already done")
+    valid_done = set()
+    if done_ids:
+        for r in read_jsonl(output_path):
+            if r.get("y_prime", ""):
+                valid_done.add(r["instance_id"])
+    done_ids = valid_done
 
     print(f"\nStart generating ({len(data)} samples)...")
-
     success = skipped = 0
 
     with open(output_path, "a", encoding="utf-8") as f:
-        for _, inst in enumerate(
-            tqdm(data, desc="Generating Y' (progress)", unit="sample", ncols=100)
-        ):
+        for inst in tqdm(data, desc="Generating Y'", unit="sample", ncols=100):
             instance_id = inst.get("instance_id", "")
             if instance_id in done_ids:
                 continue
@@ -157,17 +120,23 @@ def main():
                 success += 1
             else:
                 skipped += 1
-            row = build_yprime_row(
-                tool_name,
-                instance_id,
-                [
-                    {"role": "user", "content": question},
-                    {"role": "assistant", "content": answer},
-                ],
-                answer,
-            )
 
+            row = build_sft_row(
+                name=tool_name,
+                instance_id=instance_id,
+                split="forget",
+                user_input=question,
+                assistant_output=answer,
+                extra={"y_prime": answer},
+            )
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
 
-        f"Total: {len(data)} | Success: {success} | Skipped: {skipped} | Saved to: {output_path}"
+    print(
+        f"Total: {len(data)} | Success: {success} | Skipped: {skipped} "
+        f"| Saved to: {output_path}"
+    )
+
+
+if __name__ == "__main__":
+    main()
