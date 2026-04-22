@@ -1,111 +1,151 @@
 import argparse
+import json
 import os
 import random
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional
 
-from utils.io_utils import (
-    ensure_dir,
-    read_json,
-    write_json,
-    write_jsonl,
-    load_config,
-    safe_str,
+from utils.io_utils import ensure_dir, read_json, write_json, load_config, safe_str
+
+PREFIX_TRAIN = (
+    "Anser the user's question with the help of tools. "
+    "The user cannot see the tool usage or use the tool themselves, you can use the tools. "
+    "And the user cannot see the process of your tool use, so you must give all the infomation "
+    "in Final Answer field to user. Your task is to answer the user's question, so DO NOT make up anything. "
+    'If your required parameters are missing use tool "getDetails" to ask user provide them.\n'
+    "You have access to the following tools:"
 )
 
+FORMAT_INSTRUCTIONS_TRAIN = """Use the following format:
+Question: the input question you must answer
+Thought: Answer the following three questions with one paragraph: 1) Check whether there are any general terms or pronouns that lack sufficient context or specific information. 2) Consider the question and potential approach to answer it. 3) Explain your reasoning and the steps needed to reach a solution. 
+Action: the action to take, should be one of [{tool_names}].
+Action Input: the input to the action, should be json format. All of the action input must be realistic and from the user. Never generate any action input by yourself or copy the input description.
+Observation: the result of the action and how it contributes to the solution
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: Summarize the information gathered and the reasoning behind your final answer.
+Final Answer: Provide a user-friendly and detailed answer to the original input question that summarizes all relevant information from the Thought/Action/Action Input/Observation sequences, without mentioning specific tool usage details or technical jargon. Ensure the answer is both informative and appropriate for the user."""
 
-def parse_intermediate_steps(steps: Any) -> List[Tuple[str, str, str, str]]:
-    parsed = []
-    if not isinstance(steps, list):
-        return parsed
-    for step in steps:
-        if not isinstance(step, list) or len(step) < 2:
-            continue
-        action_part, obs_part = step[0], step[1]
-        triplet = None
-        if isinstance(action_part, list):
-            if action_part and isinstance(action_part[0], list):
-                triplet = action_part[0]
-            elif len(action_part) >= 2 and isinstance(action_part[0], str):
-                triplet = action_part
-        if not isinstance(triplet, list) or len(triplet) < 2:
-            continue
-        action = safe_str(triplet[0]).strip()
-        action_input = safe_str(triplet[1]).strip()
-        thought = safe_str(triplet[2]).strip() if len(triplet) >= 3 else ""
-        thought = thought.split("\nAction:")[0].strip() if thought else ""
-        observation = safe_str(obs_part).strip()
-        parsed.append((thought, action, action_input, observation))
-    return parsed
+GET_DETAILS_DESCRIPTION = (
+    "getDetails: If the user's question lacks the essential information needed to "
+    "answer the question effectively, or if the question contains vague terms or "
+    "pronouns without sufficient context, invoke the `getDetails` function to prompt "
+    "the user for the missing critical details. However, `getDetails` should not be "
+    "used in cases where the user omits optional parameters, unless these parameters "
+    "become necessary in the course of the conversation.\n"
+    'Parameters: {"Question": "The question to prompt user to provide sufficient information."}\n'
+    "Output: User's response."
+)
 
-
-def serialize_trace(instance: Dict[str, Any]) -> str:
-    lines = []
-    for thought, action, action_input, obs in parse_intermediate_steps(
-        instance.get("intermediate_steps", [])
-    ):
-        if thought:
-            lines.append(f"Thought: {thought}")
-        if action:
-            lines.append(f"Action: {action}")
-        if action_input:
-            lines.append(f"Action Input: {action_input}")
-        if obs:
-            lines.append(f"Observation: {obs}")
-        lines.append("")
-    final = safe_str(instance.get("output", "")).strip()
-    if final:
-        lines.append(f"Final Answer: {final}")
-    return "\n".join(lines).strip()
+_SKIP_NO_STEPS = "no intermediate_steps"
+_SKIP_TOO_MANY_STEPS = "too many steps (> 5)"
+_SKIP_ONLY_GET_DETAILS = "only used getDetails"
 
 
-def flatten_tools(
-    tools: List[Dict[str, Any]], verbose: bool = False
-) -> List[Dict[str, Any]]:
-    flat = []
-    used_ids = set()
-    name_max_idx = {}
+def rreplace(s: str, old: str, new: str, occurrence: int = 1) -> str:
+    """Right-anchored replace: replace the last *occurrence* of *old* with *new*."""
+    parts = s.rsplit(old, occurrence)
+    return new.join(parts)
 
-    for t in tools:
-        name = t.get("Name", "")
-        instances = t.get("Instances", [])
 
-        if not isinstance(instances, list):
-            continue
+def build_prefix(api_info: Dict[str, Any], question: str) -> str:
+    func_desc = api_info.get("Function_Description", {})
+    func_proj = api_info.get("Function_Projection", {})
+    components_desc = func_desc.get("components", "")
 
-        for i, inst in enumerate(instances):
-            if not isinstance(inst, dict):
-                continue
+    tool_lines = [GET_DETAILS_DESCRIPTION]
+    tool_names = ["getDetails"]
 
-            user = safe_str(inst.get("input", "")).strip()
-            trace = serialize_trace(inst).strip()
-            if not user or not trace:
-                continue
+    func_names = list(func_proj.keys())
+    for idx, func_name in enumerate(func_names):
+        desc = func_desc.get(func_name, "")
+        if idx == len(func_names) - 1:
+            desc += components_desc
+        tool_lines.append(f"{func_name}: {desc}")
+        tool_names.append(func_name)
 
-            base_id = f"{name}_{i}"
-            if base_id not in used_ids:
-                instance_id = base_id
-                used_ids.add(instance_id)
-                name_max_idx[name] = max(name_max_idx.get(name, -1), i)
-            else:
-                next_idx = name_max_idx.get(name, i) + 1
-                instance_id = f"{name}_{next_idx}"
-                used_ids.add(instance_id)
-                name_max_idx[name] = next_idx
-                if verbose:
-                    print(f"Duplicate: {base_id} -> {instance_id}")
+    tools_block = "\n".join(tool_lines)
+    tool_names_str = ", ".join(tool_names)
+    fmt = FORMAT_INSTRUCTIONS_TRAIN.replace("{tool_names}", tool_names_str)
 
-            flat.append(
-                {
-                    "Name": name,
-                    "instance_id": instance_id,
-                    "messages": [
-                        {"role": "user", "content": user},
-                        {"role": "assistant", "content": trace},
-                    ],
-                }
-            )
+    return (
+        f"{PREFIX_TRAIN}\n\n"
+        f"{tools_block}\n\n"
+        f"{fmt}\n\n"
+        f"Begin!\n\n"
+        f"Question: {question}\n"
+        f"Thought:"
+    )
 
-    return flat
+
+def build_sample(
+    instance: Dict[str, Any],
+    api_info: Dict[str, Any],
+    name: str = "",
+    idx: int = -1,
+) -> Optional[List]:
+    """Build one [process, trainable] sample.
+
+    Trainability rules:
+      chunk                          trainable
+      ──────────────────────────────────────────
+      prompt prefix                  False
+      Thought + Action + Input       True
+      Observation (API return)       False
+      Final Thought + Final Answer   True
+
+    EOS は preprocess で source[0][-1] += " " + EOS_TOKEN として統一付与。
+    """
+    label = f"{name}_{idx}" if name else str(idx)
+
+    if not instance.get("intermediate_steps"):
+        print(f"Skipping {label}: {_SKIP_NO_STEPS}")
+        return None
+    if len(instance["intermediate_steps"]) > 5:
+        print(f"Skipping {label}: {_SKIP_TOO_MANY_STEPS}")
+        return None
+
+    question = instance.get("input", "").rsplit("\nHint: ", 1)[0]
+    prefix = build_prefix(api_info, question)
+
+    process = [prefix + " "]
+    trainable = [False]
+
+    used_tools: set[str] = set()
+    for step in instance["intermediate_steps"]:
+        thought_action = rreplace(
+            thought_action, "\nAction Input:", "\nAction Input:", 1
+        )
+        thought_action = rreplace(thought_action, "\nAction:", "\nAction:", 1)
+        trainable.append(True)
+
+        process.append(step[1] + "\nThought: ")
+        trainable.append(False)
+
+        used_tools.add(step[0][0])
+
+    if len(used_tools) == 1 and list(used_tools)[0] == "getDetails":
+        print(f"Skipping {label}: {_SKIP_ONLY_GET_DETAILS}")
+        return None
+
+    final_thought = instance.get("Final Thought", "I now know the final answer.")
+    output = safe_str(instance.get("output", "")).strip()
+    process.append(f"{final_thought}\nFinal Answer: {output}")
+    trainable.append(True)
+
+    return [process, trainable]
+
+
+def build_dataset_for_api(api_info: Dict[str, Any]) -> List:
+    """Build all valid training samples for one API tool."""
+    if api_info.get("Function_Description") is None:
+        return []
+    name = api_info.get("Name", "")
+    results = []
+    for idx, instance in enumerate(api_info.get("Instances", [])):
+        sample = build_sample(instance, api_info, name=name, idx=idx)
+        if sample is not None:
+            results.append(sample)
+    return results
 
 
 def main():
@@ -114,15 +154,13 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-
-    prep_cfg = cfg.get("prep_train") if isinstance(cfg, dict) else None
+    prep_cfg = cfg.get("prep_train")
     if not isinstance(prep_cfg, dict):
         raise ValueError("Missing prep_train section in config")
 
     required_keys = [
         "input_path",
         "forget_ratio",
-        "flat_instances_path",
         "split_tools_path",
         "forget_output_path",
         "retain_output_path",
@@ -131,69 +169,67 @@ def main():
     if missing:
         raise ValueError(f"Missing prep_train config: {', '.join(missing)}")
 
-    in_json = prep_cfg["input_path"]
-    forget_ratio = prep_cfg["forget_ratio"]
-    max_train_tools = prep_cfg.get("max_tools")
+    for key in ("split_tools_path", "forget_output_path", "retain_output_path"):
+        ensure_dir(os.path.dirname(prep_cfg[key]) or ".")
+    if prep_cfg.get("flat_instances_path"):
+        ensure_dir(os.path.dirname(prep_cfg["flat_instances_path"]) or ".")
+
     seed = 42
-    flat_instances_path = prep_cfg["flat_instances_path"]
-    split_tools_path = prep_cfg["split_tools_path"]
-    forget_output_path = prep_cfg["forget_output_path"]
-    retain_output_path = prep_cfg["retain_output_path"]
-
-    for p in [
-        flat_instances_path,
-        split_tools_path,
-        forget_output_path,
-        retain_output_path,
-    ]:
-        ensure_dir(os.path.dirname(p) or ".")
-
     random.seed(seed)
 
-    tools = read_json(in_json)
+    tools = read_json(prep_cfg["input_path"])
     if not isinstance(tools, list):
-        raise ValueError("Expected a list of tools in the input JSON.")
+        raise ValueError("Expected a list of tools in input JSON.")
 
-    # 1. train_flat_new.jsonl 一定是全部攤平的資料
-    flat = flatten_tools(tools, verbose=True)
-    all_tool_names = sorted({r["Name"] for r in flat if r["Name"]})
-    write_jsonl(flat_instances_path, flat)
-    print(f"Saved {flat_instances_path}: {len(all_tool_names)}/{len(flat)} tools/instances")
+    all_samples: List[Dict[str, Any]] = []
+    for api in tools:
+        name = api.get("Name", "")
+        for sample in build_dataset_for_api(api):
+            all_samples.append({"Name": name, "data": sample})
 
-    # 2. max_tools 只影響 split/forget/retain 三個檔案
-    if max_train_tools:
-        random.seed(seed)
-        if len(all_tool_names) < max_train_tools:
-            print(f"Warning: only {len(all_tool_names)} unique tools, less than max_tools={max_train_tools}")
-            selected_tools = all_tool_names
-        else:
-            selected_tools = random.sample(all_tool_names, max_train_tools)
-    else:
-        selected_tools = all_tool_names
+    all_tool_names = sorted({s["Name"] for s in all_samples})
+    print(f"Total samples: {len(all_samples)}, unique tools: {len(all_tool_names)}")
 
-    split_tool_names = list(selected_tools)
+    if prep_cfg.get("flat_instances_path"):
+        flat_data = [s["data"] for s in all_samples]
+        with open(prep_cfg["flat_instances_path"], "w", encoding="utf-8") as f:
+            json.dump(flat_data, f, ensure_ascii=False, indent=4)
+        print(
+            f"Saved flat: {prep_cfg['flat_instances_path']} ({len(flat_data)} samples)"
+        )
+
+    split_tool_names = list(all_tool_names)
+    if prep_cfg.get("max_tools"):
+        split_tool_names = random.sample(
+            split_tool_names, min(len(split_tool_names), prep_cfg["max_tools"])
+        )
+
     random.shuffle(split_tool_names)
-    k = max(1, int(len(split_tool_names) * forget_ratio))
+    k = max(1, int(len(split_tool_names) * prep_cfg["forget_ratio"]))
     tf_tools = set(split_tool_names[:k])
     tr_tools = set(split_tool_names[k:])
 
     split_dict = {
         "seed": seed,
-        "forget_ratio": forget_ratio,
+        "forget_ratio": prep_cfg["forget_ratio"],
         "num_tools": len(split_tool_names),
         "tf_tools": sorted(tf_tools),
         "tr_tools": sorted(tr_tools),
     }
-    write_json(split_tools_path, split_dict)
+    write_json(prep_cfg["split_tools_path"], split_dict)
 
-    # forget/retain 依 split_tools 分配
-    forget_rows = [r for r in flat if r["Name"] in split_dict["tf_tools"]]
-    retain_rows = [r for r in flat if r["Name"] in split_dict["tr_tools"]]
+    forget_data = [s["data"] for s in all_samples if s["Name"] in tf_tools]
+    retain_data = [s["data"] for s in all_samples if s["Name"] in tr_tools]
 
-    write_jsonl(forget_output_path, forget_rows)
-    write_jsonl(retain_output_path, retain_rows)
+    for path, data in [
+        (prep_cfg["forget_output_path"], forget_data),
+        (prep_cfg["retain_output_path"], retain_data),
+    ]:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
 
-    print(f"Forget tools/instances: {len(split_dict['tf_tools'])}/{len(forget_rows)} | Retain tools/instances: {len(split_dict['tr_tools'])}/{len(retain_rows)}")
+    print(f"Forget: {len(tf_tools)} tools / {len(forget_data)} samples")
+    print(f"Retain: {len(tr_tools)} tools / {len(retain_data)} samples")
 
 
 if __name__ == "__main__":
