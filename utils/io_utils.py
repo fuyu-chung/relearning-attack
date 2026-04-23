@@ -1,13 +1,3 @@
-"""
-io_utils.py — shared I/O helpers for all pipeline modules.
-
-New helpers (items 1 & 5):
-  - resolve_config_key : unified config key resolution with legacy fallback
-  - get_done_ids       : resume logic (collect already-processed instance_ids)
-"""
-
-from __future__ import annotations
-
 import json
 import os
 from pathlib import Path
@@ -26,11 +16,7 @@ def resolve_config_key(
     required: bool = True,
     default: Any = None,
 ) -> Any:
-    """Return cfg[primary], falling back to legacy_keys in order.
 
-    Prints a deprecation warning for each legacy key that is hit.
-    Raises ValueError if required=True and nothing is found.
-    """
     if primary in cfg:
         return cfg[primary]
     for key in legacy_keys:
@@ -46,11 +32,6 @@ def resolve_config_key(
 
 
 def get_done_ids(output_path: str | Path, valid_ids: Optional[set] = None) -> set:
-    """Return the set of instance_ids already written to *output_path*.
-
-    If *valid_ids* is given, only ids that appear in that set are returned
-    (stale ids from a previous run with a different eval set are ignored).
-    """
     p = Path(output_path)
     if not p.exists():
         return set()
@@ -115,12 +96,6 @@ def load_model(
     offload_dir: Optional[str] = None,
     local_files_only: bool = True,
 ):
-    """Load tokenizer + model.
-
-    If *base_model_path* is provided, treat *model_path* as a PEFT/LoRA
-    adapter on top of *base_model_path*; otherwise load *model_path* as a
-    full model.
-    """
     hf_kw: dict = {"local_files_only": local_files_only}
 
     tokenizer = AutoTokenizer.from_pretrained(

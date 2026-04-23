@@ -16,8 +16,9 @@ from trl import SFTTrainer
 from peft import LoraConfig
 
 from utils import io_utils
-from utils.io_utils import load_config, resolve_config_key
+from utils.io_utils import load_config, resolve_config_key, read_json, read_jsonl
 from utils.io_utils import load_model as _load_model_shared
+from utils.trace_utils import build_forget_rows, build_retain_rows
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,7 +26,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--config", default="configs/train.yaml")
     ap.add_argument("--suffix", default=None, help="Append suffix to output_dir")
     ap.add_argument("--forget_data_path", default=None)
-    ap.add_argument("--retain_data_path", default=None)
     ap.add_argument("--model_output_dir", default=None)
     ap.add_argument("--retain_ratio", default=None, type=float)
     return ap.parse_args()
@@ -59,7 +59,6 @@ def validate_input_file(path: str, label: str) -> None:
 
 
 def load_model(model_path: str, local_files_only: bool = True):
-    """Thin wrapper around the shared load_model that sets training defaults."""
     tokenizer, model = _load_model_shared(model_path, local_files_only=local_files_only)
     tokenizer.padding_side = "right"
     model.config.use_cache = False
@@ -71,50 +70,6 @@ def save_model_bundle(model, tokenizer, output_dir: str) -> None:
     io_utils.ensure_dir(output_dir)
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-
-
-def build_forget_rows(instances: list) -> list:
-    rows = []
-    for inst in instances:
-        msgs = inst.get("messages", [])
-        user = msgs[0].get("content", "").strip() if msgs else ""
-        y_prime = inst.get("y_prime", "").strip()
-        if not user or not y_prime:
-            continue
-        rows.append(
-            {
-                "Name": inst.get("Name", ""),
-                "instance_id": inst.get("instance_id", ""),
-                "split": "forget",
-                "messages": [
-                    {"role": "user", "content": user},
-                    {"role": "assistant", "content": y_prime},
-                ],
-            }
-        )
-    return rows
-
-
-def build_retain_rows(instances: list) -> list:
-    rows = []
-    for inst in instances:
-        msgs = inst.get("messages", [])
-        user = msgs[0].get("content", "").strip() if msgs else ""
-        asst = msgs[1].get("content", "").strip() if len(msgs) > 1 else ""
-        if not user or not asst:
-            continue
-        rows.append(
-            {
-                "Name": inst.get("Name", ""),
-                "instance_id": inst.get("instance_id", ""),
-                "split": "retain",
-                "messages": [
-                    {"role": "user", "content": user},
-                    {"role": "assistant", "content": asst},
-                ],
-            }
-        )
-    return rows
 
 
 def stratified_sample_by_tool(rows: list, target_count: int, seed: int = 42) -> list:
@@ -202,21 +157,12 @@ def balance_and_merge(
 
 def format_chat_template(examples: dict) -> dict:
     texts = []
-    for messages in examples.get("messages", []):
-        text = ""
-        for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "user":
-                text += f"User: {content}\n"
-            elif role == "assistant":
-                text += f"Assistant: {content}\n"
-        texts.append(text.strip())
+    for process in examples.get("process", []):
+        texts.append("".join(process).strip())
     return {"text": texts}
 
 
 def ensure_random_model(model_path: str, output_path: str, seed: int = 42) -> str:
-    """Generate a random-initialised checkpoint (θᴿ) for task arithmetic."""
     if os.path.exists(os.path.join(output_path, "config.json")):
         print(f"✓ Random model already exists at {output_path}")
         return output_path
@@ -251,12 +197,11 @@ def apply_task_arithmetic(
     if random_model_path is None:
         return trained_model
 
-    hf_kw = {"local_files_only": local_files_only}
     load_kw = {
         "torch_dtype": torch.float16,
         "device_map": "cpu",
         "low_cpu_mem_usage": True,
-        **hf_kw,
+        "local_files_only": local_files_only,
     }
 
     theta0 = AutoModelForCausalLM.from_pretrained(base_model, **load_kw)
@@ -305,13 +250,8 @@ def main():
         required=False,
         default="out/forget_yprime.jsonl",
     )
-    retain_jsonl = resolve_config_key(
-        cfg,
-        "retain_data_path",
-        "retain_sft",
-        required=False,
-        default="out/retain_sft.jsonl",
-    )
+    train_tools_path = resolve_config_key(cfg, "train_tools_path")
+    split_tools_path = resolve_config_key(cfg, "split_tools_path")
     model_path = resolve_config_key(
         cfg,
         "model_path",
@@ -324,7 +264,6 @@ def main():
     )
     output_dir = resolve_config_key(
         cfg,
-        "output_dir",
         "model_output_dir",
         "tooldelete_sft_model_dir",
         required=False,
@@ -334,8 +273,6 @@ def main():
 
     if args.forget_data_path:
         forget_jsonl = args.forget_data_path
-    if args.retain_data_path:
-        retain_jsonl = args.retain_data_path
     if args.model_output_dir:
         output_dir = args.model_output_dir
     if suffix:
@@ -355,10 +292,16 @@ def main():
 
     set_global_seed(42)
     validate_input_file(forget_jsonl, "forget_jsonl")
-    validate_input_file(retain_jsonl, "retain_jsonl")
 
-    forget_rows = build_forget_rows(io_utils.read_jsonl(forget_jsonl))
-    retain_rows = build_retain_rows(io_utils.read_jsonl(retain_jsonl))
+    # forget rows: from gen_yprime output (Name, instance_id, question, y_prime)
+    forget_rows = build_forget_rows(read_jsonl(forget_jsonl))
+
+    # retain rows: from train_data.json filtered by split_tools.json
+    train_tools = read_json(train_tools_path)
+    split_tools = read_json(split_tools_path)
+    tr_tools = set(split_tools.get("tr_tools", []))
+    retain_rows = build_retain_rows(train_tools, tr_tools)
+
     train_rows = balance_and_merge(
         forget_rows,
         retain_rows,

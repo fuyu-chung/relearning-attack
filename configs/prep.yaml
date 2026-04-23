@@ -1,13 +1,7 @@
-prep_train:
-  input_path: data/train_data.json
-  forget_ratio: 0.2
-  max_tools: 200
-  flat_instances_path: out/flat_instances.jsonl
-  split_tools_path: out/split_tools.json
-  forget_output_path: out/forget_sft.jsonl
-  retain_output_path: out/retain_sft.jsonl
-
-prep_eval:
-  input_path: data/eval_simulated.json
-  output_path: out/eval_flat.jsonl
-
+input_path: data/train_data.json
+forget_ratio: 0.2
+max_tools: 200
+flat_instances_path: out/flat_instances.json
+split_tools_path: out/split_tools_new.json
+forget_output_path: out/forget_train.json
+retain_output_path: out/retain_train.json
