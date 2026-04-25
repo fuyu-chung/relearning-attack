@@ -1,7 +1,8 @@
+# prep_train.py
 input_path: data/train_data.json
 forget_ratio: 0.2
 max_tools: 200
 flat_instances_path: out/flat_instances.json
-split_tools_path: out/split_tools_new.json
+split_tools_path: out/split_tools.json
 forget_output_path: out/forget_train.json
 retain_output_path: out/retain_train.json

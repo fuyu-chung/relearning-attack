@@ -16,46 +16,10 @@ from utils.trace_utils import (
     get_tool_names,
     serialize_golden,
     serialize_golden_from_steps,
-)
-
-PREFIX_TRAIN = (
-    "Answer the user's question with the help of tools. "
-    "The user cannot see the tool usage or use the tool themselves, you can use the tools. "
-    "And the user cannot see the process of your tool use, so you must give all the infomation "
-    "in Final Answer field to user. Your task is to answer the user's question, so DO NOT make up anything. "
-    'If your required parameters are missing use tool "getDetails" to ask user provide them.\n'
-    "You have access to the following tools:"
-)
-
-FORMAT_INSTRUCTIONS_TRAIN = (
-    "Use the following format:\n"
-    "Question: the input question you must answer\n"
-    "Thought: Answer the following three questions with one paragraph: "
-    "1) Check whether there are any general terms or pronouns that lack sufficient context or specific information. "
-    "2) Consider the question and potential approach to answer it. "
-    "3) Explain your reasoning and the steps needed to reach a solution.\n"
-    "Action: the action to take, should be one of [{tool_names}].\n"
-    "Action Input: the input to the action, should be json format. "
-    "All of the action input must be realistic and from the user. "
-    "Never generate any action input by yourself or copy the input description.\n"
-    "Observation: the result of the action and how it contributes to the solution\n"
-    "... (this Thought/Action/Action Input/Observation can repeat N times)\n"
-    "Thought: Summarize the information gathered and the reasoning behind your final answer.\n"
-    "Final Answer: Provide a user-friendly and detailed answer to the original input question "
-    "that summarizes all relevant information from the Thought/Action/Action Input/Observation sequences, "
-    "without mentioning specific tool usage details or technical jargon. "
-    "Ensure the answer is both informative and appropriate for the user."
-)
-
-GET_DETAILS_DESCRIPTION = (
-    "getDetails: If the user's question lacks the essential information needed to "
-    "answer the question effectively, or if the question contains vague terms or "
-    "pronouns without sufficient context, invoke the `getDetails` function to prompt "
-    "the user for the missing critical details. However, `getDetails` should not be "
-    "used in cases where the user omits optional parameters, unless these parameters "
-    "become necessary in the course of the conversation.\n"
-    'Parameters: {"Question": "The question to prompt user to provide sufficient information."}\n'
-    "Output: User's response."
+    build_id_to_instance,
+    PREFIX_TRAIN,
+    FORMAT_INSTRUCTIONS_TRAIN,
+    GET_DETAILS_DESCRIPTION,
 )
 
 
@@ -76,17 +40,18 @@ def build_prompt(user_input: str, nl_doc: str, tool_names: str) -> str:
 def load_data(cfg: dict) -> list:
     eval_tools_path = resolve_config_key(cfg, "eval_tools_path")
     train_tools_path = resolve_config_key(cfg, "train_tools_path")
-    split_tools_path = resolve_config_key(cfg, "split_tools_path")
+    forget_data_path = resolve_config_key(cfg, "forget_data_path")
+    retain_data_path = resolve_config_key(cfg, "retain_data_path")
 
     eval_tools = read_json(eval_tools_path)
     train_tools = read_json(train_tools_path)
-    split_tools = read_json(split_tools_path)
+    forget_raw = read_json(forget_data_path)
+    retain_raw = read_json(retain_data_path)
 
-    tf_tools = set(split_tools.get("tf_tools", []))
-    tr_tools = set(split_tools.get("tr_tools", []))
+    train_map = {t["Name"]: t for t in train_tools}
+    id_to_instance = build_id_to_instance(train_tools)
 
-    eval_data, forget_data, retain_data = [], [], []
-
+    eval_data = []
     for t in eval_tools:
         name = t.get("Name", "")
         nl_doc = t.get("NLDocumentation", "")
@@ -109,33 +74,54 @@ def load_data(cfg: dict) -> list:
                 }
             )
 
-    for t in train_tools:
-        name = t.get("Name", "")
-        if name not in tf_tools and name not in tr_tools:
-            continue
-        split = "forget" if name in tf_tools else "retain"
-        nl_doc = t.get("NLDocumentation", "")
-        tool_names = get_tool_names(nl_doc)
-        for i, inst in enumerate(t.get("Instances", [])):
-            steps = inst.get("intermediate_steps", [])
-            if not steps:
+    def convert(raw: list, split: str) -> list:
+        rows = []
+        dropped = 0
+        for item in raw:
+            name = item.get("Name", "")
+            instance_id = item.get("instance_id", "")
+            if not name or not instance_id:
+                dropped += 1
                 continue
-            question = inst.get("input", "").rsplit("\nHint: ", 1)[0].strip()
-            gt_trace = serialize_golden_from_steps(steps)
-            if not question or not gt_trace:
+
+            tool = train_map.get(name)
+            if not tool:
+                print(f"Drop {split}/{instance_id}: no tool {name}")
+                dropped += 1
                 continue
-            target = forget_data if split == "forget" else retain_data
-            target.append(
+
+            inst = id_to_instance.get(instance_id)
+            if inst is None:
+                print(f"Drop {split}/{instance_id}: not found in id_to_instance")
+                dropped += 1
+                continue
+
+            nl_doc = tool.get("NLDocumentation", "")
+            tool_names = get_tool_names(nl_doc)
+            user_input = inst.get("input", "").rsplit("\nHint: ", 1)[0].strip()
+            gt_trace = serialize_golden_from_steps(inst.get("intermediate_steps", []))
+
+            if not user_input or not gt_trace:
+                print(f"Drop {split}/{instance_id}: empty input or gt_trace")
+                dropped += 1
+                continue
+
+            rows.append(
                 {
                     "Name": name,
-                    "instance_id": f"{name}_{i}",
+                    "instance_id": instance_id,
                     "nl_doc": nl_doc,
                     "tool_names": tool_names,
-                    "input": question,
+                    "input": user_input,
                     "gt_trace": gt_trace,
                     "split": split,
                 }
             )
+
+        return rows
+
+    forget_data = convert(forget_raw, "forget")
+    retain_data = convert(retain_raw, "retain")
 
     all_data = eval_data + forget_data + retain_data
     print(
@@ -150,20 +136,14 @@ def generate_trace(
 ) -> str:
     prompt = build_prompt(user_input, nl_doc, tool_names)
     inputs = tokenizer(
-        prompt, return_tensors="pt", truncation=True, max_length=2048
+        prompt, return_tensors="pt", truncation=True, max_length=4096
     ).to(model.device)
-
-    gen_cfg = getattr(model, "generation_config", None)
-    max_new_tokens = getattr(gen_cfg, "max_new_tokens", 512) if gen_cfg else 512
-    temperature = getattr(gen_cfg, "temperature", 1.0) if gen_cfg else 1.0
-    do_sample = getattr(gen_cfg, "do_sample", False) if gen_cfg else False
 
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=do_sample,
+            max_new_tokens=512,
+            do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )

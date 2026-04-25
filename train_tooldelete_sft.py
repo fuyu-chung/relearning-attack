@@ -6,14 +6,15 @@ import torch
 from collections import defaultdict
 from typing import Optional
 
-from datasets import Dataset
+from torch.utils.data import Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoConfig,
+    Trainer,
     TrainingArguments,
 )
-from trl import SFTTrainer
-from peft import LoraConfig
+from transformers.trainer_pt_utils import LabelSmoother
+from peft import LoraConfig, get_peft_model
 
 from utils import io_utils
 from utils.io_utils import load_config, resolve_config_key, read_json, read_jsonl
@@ -26,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--config", default="configs/train.yaml")
     ap.add_argument("--suffix", default=None, help="Append suffix to output_dir")
     ap.add_argument("--forget_data_path", default=None)
+    ap.add_argument("--retain_data_path", default=None)
     ap.add_argument("--model_output_dir", default=None)
     ap.add_argument("--retain_ratio", default=None, type=float)
     return ap.parse_args()
@@ -59,8 +61,10 @@ def validate_input_file(path: str, label: str) -> None:
 
 
 def load_model(model_path: str, local_files_only: bool = True):
+    """Thin wrapper around the shared load_model that sets training defaults."""
     tokenizer, model = _load_model_shared(model_path, local_files_only=local_files_only)
     tokenizer.padding_side = "right"
+    tokenizer.pad_token = tokenizer.unk_token
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
     return tokenizer, model
@@ -155,14 +159,82 @@ def balance_and_merge(
     return combined
 
 
-def format_chat_template(examples: dict) -> dict:
-    texts = []
-    for process in examples.get("process", []):
-        texts.append("".join(process).strip())
-    return {"text": texts}
+IGNORE_TOKEN_ID = LabelSmoother.ignore_index
+EOS_TOKEN = "</s>"
+
+
+def preprocess(sources, tokenizer) -> dict:
+    """Token-level masking: only trainable=True segments contribute to loss.
+
+    Mirrors train.py preprocess() exactly.
+    """
+    conversations, trainables = [], []
+    for source in sources:
+        source[0][-1] += " " + EOS_TOKEN
+        conversations.append(source[0])
+        trainables.append(source[1])
+
+    input_ids = tokenizer(
+        ["".join(c) for c in conversations],
+        return_tensors="pt",
+        padding="max_length",
+        max_length=2048,
+        truncation=True,
+    ).input_ids
+    targets = input_ids.clone()
+
+    for conversation, target, trainable in zip(conversations, targets, trainables):
+        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+        cur_len = 1
+        target[:cur_len] = IGNORE_TOKEN_ID
+        for conv, train in zip(conversation, trainable):
+            round_len = len(tokenizer(conv).input_ids) - 2
+            if conv.endswith(EOS_TOKEN):
+                round_len += 1
+            if not train:
+                target[cur_len : cur_len + round_len] = IGNORE_TOKEN_ID
+            cur_len += round_len
+        target[cur_len:] = IGNORE_TOKEN_ID
+
+        if cur_len < tokenizer.model_max_length:
+            if cur_len != total_len:
+                print(f"WARNING: tokenization mismatch {cur_len} vs. {total_len}")
+
+    return dict(
+        input_ids=input_ids,
+        labels=targets,
+        attention_mask=input_ids.ne(tokenizer.pad_token_id),
+    )
+
+
+class ToolDeleteDataset(Dataset):
+    """Lazy dataset for ToolDelete SFT, mirrors LazySupervisedDataset from train.py."""
+
+    def __init__(self, rows: list, tokenizer):
+        super().__init__()
+        self.tokenizer = tokenizer
+        # rows: list of dicts with process + trainable keys
+        self.list_data = [[r["process"], r["trainable"]] for r in rows]
+        self.cached: dict = {}
+
+    def __len__(self):
+        return len(self.list_data)
+
+    def __getitem__(self, i):
+        if i in self.cached:
+            return self.cached[i]
+        ret = preprocess([self.list_data[i]], self.tokenizer)
+        ret = dict(
+            input_ids=ret["input_ids"][0],
+            labels=ret["labels"][0],
+            attention_mask=ret["attention_mask"][0],
+        )
+        self.cached[i] = ret
+        return ret
 
 
 def ensure_random_model(model_path: str, output_path: str, seed: int = 42) -> str:
+    """Generate a random-initialised checkpoint (θᴿ) for task arithmetic."""
     if os.path.exists(os.path.join(output_path, "config.json")):
         print(f"✓ Random model already exists at {output_path}")
         return output_path
@@ -243,15 +315,19 @@ def main():
         cfg, "output_dir", "out_dir", required=False, default="out"
     )
 
-    forget_jsonl = resolve_config_key(
+    forget_yprime_path = resolve_config_key(
         cfg,
         "forget_data_path",
         "forget_yprime",
         required=False,
         default="out/forget_yprime.jsonl",
     )
-    train_tools_path = resolve_config_key(cfg, "train_tools_path")
-    split_tools_path = resolve_config_key(cfg, "split_tools_path")
+    retain_json = resolve_config_key(
+        cfg,
+        "retain_data_path",
+        required=False,
+        default="out/retain_train.json",
+    )
     model_path = resolve_config_key(
         cfg,
         "model_path",
@@ -272,7 +348,9 @@ def main():
     random_model = cfg.get("random_model_path", cfg.get("random_model"))
 
     if args.forget_data_path:
-        forget_jsonl = args.forget_data_path
+        forget_yprime_path = args.forget_data_path
+    if args.retain_data_path:
+        retain_json = args.retain_data_path
     if args.model_output_dir:
         output_dir = args.model_output_dir
     if suffix:
@@ -291,16 +369,13 @@ def main():
         retain_balance_ratio = args.retain_ratio
 
     set_global_seed(42)
-    validate_input_file(forget_jsonl, "forget_jsonl")
+    validate_input_file(forget_yprime_path, "forget_yprime")
 
     # forget rows: from gen_yprime output (Name, instance_id, question, y_prime)
-    forget_rows = build_forget_rows(read_jsonl(forget_jsonl))
+    forget_rows = build_forget_rows(list(read_jsonl(forget_yprime_path)))
 
-    # retain rows: from train_data.json filtered by split_tools.json
-    train_tools = read_json(train_tools_path)
-    split_tools = read_json(split_tools_path)
-    tr_tools = set(split_tools.get("tr_tools", []))
-    retain_rows = build_retain_rows(train_tools, tr_tools)
+    # retain rows: from retain_train.json (Name, instance_id, process, trainable)
+    retain_rows = build_retain_rows(read_json(retain_json))
 
     train_rows = balance_and_merge(
         forget_rows,
@@ -310,33 +385,33 @@ def main():
         retain_sampling_mode,
     )
 
-    dataset = Dataset.from_list(train_rows)
-    dataset = dataset.map(
-        format_chat_template, batched=True, remove_columns=dataset.column_names
-    )
-
     tokenizer, model = load_model(model_path, local_files_only=True)
 
-    trainer = SFTTrainer(
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
+    train_dataset = ToolDeleteDataset(train_rows, tokenizer)
+
+    trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
-        train_dataset=dataset,
-        peft_config=LoraConfig(
-            r=16,
-            lora_alpha=32,
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-        ),
+        train_dataset=train_dataset,
         args=TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=3,
@@ -356,9 +431,6 @@ def main():
             seed=42,
             report_to="none",
         ),
-        max_seq_length=1024,
-        packing=False,
-        dataset_text_field="text",
     )
     trainer.train()
 

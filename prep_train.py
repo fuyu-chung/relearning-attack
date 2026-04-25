@@ -4,10 +4,9 @@ import os
 import random
 from typing import Any, Dict, List
 
+
 from utils.io_utils import ensure_dir, read_json, write_json, load_config
-from utils.trace_utils import (
-    build_dataset_for_api,
-)
+from utils.trace_utils import build_sample
 
 
 def main():
@@ -16,9 +15,7 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    prep_cfg = cfg.get("prep_train")
-    if not isinstance(prep_cfg, dict):
-        raise ValueError("Missing prep_train section in config")
+    prep_cfg = cfg.get("prep_train", cfg)
 
     required_keys = [
         "input_path",
@@ -43,17 +40,50 @@ def main():
     if not isinstance(tools, list):
         raise ValueError("Expected a list of tools in input JSON.")
 
+    used_ids: set = set()
+    name_max_idx: Dict[str, int] = {}
     all_samples: List[Dict[str, Any]] = []
+
     for api in tools:
         name = api.get("Name", "")
-        for sample in build_dataset_for_api(api):
-            all_samples.append({"Name": name, "data": sample})
+        instances = api.get("Instances", [])
+        for raw_idx, inst in enumerate(instances):
+            sample = build_sample(inst, api, name=name, idx=raw_idx)
+            if sample is None:
+                continue
+
+            base_id = f"{name}_{raw_idx}"
+            if base_id not in used_ids:
+                instance_id = base_id
+                used_ids.add(instance_id)
+                name_max_idx[name] = max(name_max_idx.get(name, -1), raw_idx)
+            else:
+                next_idx = name_max_idx.get(name, raw_idx) + 1
+                instance_id = f"{name}_{next_idx}"
+                used_ids.add(instance_id)
+                name_max_idx[name] = next_idx
+
+            all_samples.append(
+                {
+                    "Name": name,
+                    "instance_id": instance_id,
+                    "data": sample,
+                }
+            )
 
     all_tool_names = sorted({s["Name"] for s in all_samples})
     print(f"Total samples: {len(all_samples)}, unique tools: {len(all_tool_names)}")
 
     if prep_cfg.get("flat_instances_path"):
-        flat_data = [s["data"] for s in all_samples]
+        flat_data = [
+            {
+                "Name": s["Name"],
+                "instance_id": s["instance_id"],
+                "process": s["data"][0],
+                "trainable": s["data"][1],
+            }
+            for s in all_samples
+        ]
         with open(prep_cfg["flat_instances_path"], "w", encoding="utf-8") as f:
             json.dump(flat_data, f, ensure_ascii=False, indent=4)
         print(
@@ -80,8 +110,19 @@ def main():
     }
     write_json(prep_cfg["split_tools_path"], split_dict)
 
-    forget_data = [s["data"] for s in all_samples if s["Name"] in tf_tools]
-    retain_data = [s["data"] for s in all_samples if s["Name"] in tr_tools]
+    def to_records(samples):
+        return [
+            {
+                "Name": s["Name"],
+                "instance_id": s["instance_id"],
+                "process": s["data"][0],
+                "trainable": s["data"][1],
+            }
+            for s in samples
+        ]
+
+    forget_data = to_records([s for s in all_samples if s["Name"] in tf_tools])
+    retain_data = to_records([s for s in all_samples if s["Name"] in tr_tools])
 
     for path, data in [
         (prep_cfg["forget_output_path"], forget_data),

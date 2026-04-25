@@ -1,4 +1,5 @@
 import json
+import os
 import torch
 from argparse import ArgumentParser
 from tqdm import tqdm
@@ -10,7 +11,7 @@ from utils.io_utils import (
     load_model,
     resolve_config_key,
 )
-from utils.trace_utils import get_tool_names
+from utils.trace_utils import get_tool_names, build_id_to_instance
 
 
 YPRIME_PROMPT = """\
@@ -64,32 +65,38 @@ def generate_yprime(
     return clean_yprime(answer)
 
 
-def load_forget_data(train_tools_path: str, split_tools_path: str) -> list:
+def load_forget_data(forget_data_path: str, train_tools_path: str) -> list:
+    """Load forget instances from forget_train.json, back-querying train_data.json."""
+    forget_raw = read_json(forget_data_path)
     train_tools = read_json(train_tools_path)
-    split_tools = read_json(split_tools_path)
-    tf_tools = set(split_tools.get("tf_tools", []))
+
+    train_map = {t["Name"]: t for t in train_tools}
+    id_to_instance = build_id_to_instance(train_tools)
 
     data = []
-    for t in train_tools:
-        name = t.get("Name", "")
-        if name not in tf_tools:
+    for item in forget_raw:
+        name = item.get("Name", "")
+        instance_id = item.get("instance_id", "")
+        if not name or not instance_id:
             continue
-        nl_doc = t.get("NLDocumentation", "")
+        inst = id_to_instance.get(instance_id)
+        if inst is None:
+            print(f"Drop {instance_id}: not found in id_to_instance")
+            continue
+        tool = train_map.get(name, {})
+        question = inst.get("input", "").rsplit("\nHint: ", 1)[0].strip()
+        nl_doc = tool.get("NLDocumentation", "")
         tool_names = get_tool_names(nl_doc)
-        for i, inst in enumerate(t.get("Instances", [])):
-            if not inst.get("intermediate_steps"):
-                continue
-            question = inst.get("input", "").rsplit("\nHint: ", 1)[0].strip()
-            if not question:
-                continue
-            data.append(
-                {
-                    "Name": name,
-                    "instance_id": f"{name}_{i}",
-                    "question": question,
-                    "tool_names": tool_names,
-                }
-            )
+        if not question:
+            continue
+        data.append(
+            {
+                "Name": name,
+                "instance_id": instance_id,
+                "question": question,
+                "tool_names": tool_names,
+            }
+        )
     return data
 
 
@@ -100,22 +107,20 @@ def main():
 
     cfg = load_config(args.config)
 
+    forget_data_path = resolve_config_key(cfg, "forget_data_path")
     train_tools_path = resolve_config_key(cfg, "train_tools_path")
-    split_tools_path = resolve_config_key(cfg, "split_tools_path")
     model_path = resolve_config_key(cfg, "model_path", "generation_model_path")
     output_path = resolve_config_key(cfg, "output_path")
     max_new_tokens = int(
         cfg.get("generation_max_new_tokens") or cfg.get("max_new_tokens") or 256
     )
 
-    data = load_forget_data(train_tools_path, split_tools_path)
+    data = load_forget_data(forget_data_path, train_tools_path)
     print(f"Loaded {len(data)} forget instances")
 
     tokenizer, model = load_model(model_path)
 
     done_ids = set()
-    import os
-
     if os.path.exists(output_path):
         for r in read_jsonl(output_path):
             if r.get("y_prime", ""):
