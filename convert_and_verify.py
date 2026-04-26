@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-"""convert_and_verify.py
-
-從 flat_instances + id list 產生 forget_train / retain_train，
-並驗證 id 和 question 和 train_data 三方對齊。
-
-用法:
-    python convert_and_verify.py \
-        --forget_ids     out/forget_ids.json \
-        --retain_ids     out/retain_ids.json \
-        --flat_instances out/flat_instances.json \
-        --train_tools    data/train_data.json \
-        --output_dir     out/
-"""
 import json
 import argparse
 from pathlib import Path
@@ -19,10 +5,6 @@ from pathlib import Path
 from utils.io_utils import safe_str, read_json, read_jsonl
 from utils.trace_utils import build_sample
 
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 
 def load_any(path: str) -> list:
     p = Path(path)
@@ -44,15 +26,7 @@ def extract_question_from_process(process) -> str:
         return ""
 
 
-# ---------------------------------------------------------------------------
-# ground truth map — mirrors prep_train.py exactly
-# ---------------------------------------------------------------------------
-
 def build_ground_truth_map(train_tools_path: str) -> dict:
-    """Reproduce prep_train.py id -> question mapping.
-
-    Uses build_sample filter + duplicate-remap so ids match flat_instances.
-    """
     tools = read_json(train_tools_path)
     used_ids: set = set()
     name_max_idx: dict = {}
@@ -87,10 +61,6 @@ def build_ground_truth_map(train_tools_path: str) -> dict:
     return id_to_question
 
 
-# ---------------------------------------------------------------------------
-# convert
-# ---------------------------------------------------------------------------
-
 def build_split(ids: set, flat_map: dict) -> tuple[list, list]:
     result, missing = [], []
     for iid in sorted(ids):
@@ -98,18 +68,16 @@ def build_split(ids: set, flat_map: dict) -> tuple[list, list]:
         if data is None:
             missing.append(iid)
             continue
-        result.append({
-            "Name": data["Name"],
-            "instance_id": iid,
-            "process": data["process"],
-            "trainable": data["trainable"],
-        })
+        result.append(
+            {
+                "Name": data["Name"],
+                "instance_id": iid,
+                "process": data["process"],
+                "trainable": data["trainable"],
+            }
+        )
     return result, missing
 
-
-# ---------------------------------------------------------------------------
-# verify
-# ---------------------------------------------------------------------------
 
 def verify(
     flat_map: dict,
@@ -122,7 +90,6 @@ def verify(
 
     flat_ids = set(flat_map)
 
-    # 1. overlap
     overlap = forget_ids & retain_ids
     missing_forget = forget_ids - flat_ids
     missing_retain = retain_ids - flat_ids
@@ -136,7 +103,6 @@ def verify(
     print(f"  forget ids missing from flat:       {len(missing_forget)}")
     print(f"  retain ids missing from flat:       {len(missing_retain)}")
 
-    # 2. flat vs gt
     if gt:
         flat_not_in_gt = flat_ids - set(gt)
         gt_not_in_flat = set(gt) - flat_ids
@@ -146,7 +112,6 @@ def verify(
         print(f"  flat ids not in gt:  {len(flat_not_in_gt)}")
         print(f"  gt ids not in flat:  {len(gt_not_in_flat)}")
 
-        # 3. question text match
         mismatches = []
         for iid, row in flat_map.items():
             if iid not in gt:
@@ -154,11 +119,13 @@ def verify(
             flat_q = extract_question_from_process(row.get("process", []))
             gt_q = gt[iid]
             if flat_q != gt_q:
-                mismatches.append({
-                    "instance_id": iid,
-                    "flat_question": flat_q[:120],
-                    "gt_question": gt_q[:120],
-                })
+                mismatches.append(
+                    {
+                        "instance_id": iid,
+                        "flat_question": flat_q[:120],
+                        "gt_question": gt_q[:120],
+                    }
+                )
         report["question_mismatches"] = mismatches
         print(f"  question mismatches: {len(mismatches)}")
         if mismatches:
@@ -171,10 +138,13 @@ def verify(
         len(overlap) == 0
         and len(missing_forget) == 0
         and len(missing_retain) == 0
-        and (not gt or (
-            len(report.get("flat_not_in_gt", [])) == 0
-            and len(report.get("question_mismatches", [])) == 0
-        ))
+        and (
+            not gt
+            or (
+                len(report.get("flat_not_in_gt", [])) == 0
+                and len(report.get("question_mismatches", [])) == 0
+            )
+        )
     )
     report["all_ok"] = ok
     print(f"\n{'✓ All checks passed' if ok else '✗ Issues found — see report'}")
@@ -186,17 +156,13 @@ def verify(
     return ok
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--forget_ids",     required=True, help="out/forget_ids.json")
-    ap.add_argument("--retain_ids",     required=True, help="out/retain_ids.json")
+    ap.add_argument("--forget_ids", required=True, help="out/forget_ids.json")
+    ap.add_argument("--retain_ids", required=True, help="out/retain_ids.json")
     ap.add_argument("--flat_instances", required=True, help="out/flat_instances.json")
-    ap.add_argument("--train_tools",    default=None,  help="data/train_data.json")
-    ap.add_argument("--output_dir",     default="out")
+    ap.add_argument("--train_tools", default=None, help="data/train_data.json")
+    ap.add_argument("--output_dir", default="out")
     args = ap.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -211,23 +177,29 @@ def main():
     print(f"forget_ids={len(forget_ids)}, retain_ids={len(retain_ids)}")
     print(f"flat={len(flat_map)}, gt={len(gt)}")
 
-    # convert
     forget_train, missing_forget = build_split(forget_ids, flat_map)
     retain_train, missing_retain = build_split(retain_ids, flat_map)
 
     for fname, data in [
-        ("forget_train.json", forget_train),
-        ("retain_train.json", retain_train),
+        ("forget_train.jsonl", forget_train),
+        ("retain_train.jsonl", retain_train),
         ("missing_forget.json", missing_forget),
         ("missing_retain.json", missing_retain),
     ]:
-        with open(out_dir / fname, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        p = out_dir / fname
+        if fname.endswith(".jsonl"):
+            with open(p, "w", encoding="utf-8") as f:
+                for row in data:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        else:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
 
-    print(f"\nforget_train: {len(forget_train)} samples, missing: {len(missing_forget)}")
+    print(
+        f"\nforget_train: {len(forget_train)} samples, missing: {len(missing_forget)}"
+    )
     print(f"retain_train: {len(retain_train)} samples, missing: {len(missing_retain)}")
 
-    # verify
     verify(flat_map, forget_ids, retain_ids, gt, out_dir / "verify")
 
     raise SystemExit(0)

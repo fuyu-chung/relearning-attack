@@ -17,7 +17,7 @@ from transformers.trainer_pt_utils import LabelSmoother
 from peft import LoraConfig, get_peft_model
 
 from utils import io_utils
-from utils.io_utils import load_config, resolve_config_key, read_json, read_jsonl
+from utils.io_utils import load_config, resolve_config_key, read_jsonl
 from utils.io_utils import load_model as _load_model_shared
 from utils.trace_utils import build_forget_rows, build_retain_rows
 
@@ -321,7 +321,6 @@ def main():
         required=False,
         default="out/forget_yprime.jsonl",
     )
-    # retain_train.json is the canonical output from prep_train.py
     retain_json = resolve_config_key(
         cfg,
         "retain_data_path",
@@ -371,11 +370,8 @@ def main():
     set_global_seed(42)
     validate_input_file(forget_yprime_path, "forget_yprime")
 
-    # forget rows: from gen_yprime output (Name, instance_id, question, y_prime)
     forget_rows = build_forget_rows(list(read_jsonl(forget_yprime_path)))
-
-    # retain rows: from retain_train.json flat records (Name, instance_id, process, trainable)
-    retain_rows = build_retain_rows(read_json(retain_json))
+    retain_rows = build_retain_rows(read_jsonl(retain_json))
 
     train_rows = balance_and_merge(
         forget_rows,

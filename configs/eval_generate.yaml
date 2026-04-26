@@ -1,8 +1,8 @@
 # eval_generate.py
 train_tools_path: data/train_data.json
 eval_tools_path: data/eval_simulated.json
-forget_data_path: out/forget_train.json
-retain_data_path: out/retain_train.json
+forget_data_path: out/forget_train.jsonl
+retain_data_path: out/retain_train.jsonl
 adapter_model_path: tooldelete_sft_model/final
 model_path: TangQiaoYu/ToolAlpaca-7B
-output_path: out/generated_traces_new.jsonl
+output_path: out/generated_traces.jsonl

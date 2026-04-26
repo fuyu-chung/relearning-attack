@@ -1,11 +1,9 @@
 import argparse
-import json
 import os
 import random
 from typing import Any, Dict, List
 
-
-from utils.io_utils import ensure_dir, read_json, write_json, load_config
+from utils.io_utils import ensure_dir, read_json, write_json, write_jsonl, load_config
 from utils.trace_utils import build_sample
 
 
@@ -48,7 +46,7 @@ def main():
         name = api.get("Name", "")
         instances = api.get("Instances", [])
         for raw_idx, inst in enumerate(instances):
-            sample = build_sample(inst, api, name=name, idx=raw_idx)
+            sample = build_sample(inst, api, name=name, idx=raw_idx, verbose=True)
             if sample is None:
                 continue
 
@@ -74,18 +72,20 @@ def main():
     all_tool_names = sorted({s["Name"] for s in all_samples})
     print(f"Total samples: {len(all_samples)}, unique tools: {len(all_tool_names)}")
 
-    if prep_cfg.get("flat_instances_path"):
-        flat_data = [
+    def to_records(samples):
+        return [
             {
                 "Name": s["Name"],
                 "instance_id": s["instance_id"],
                 "process": s["data"][0],
                 "trainable": s["data"][1],
             }
-            for s in all_samples
+            for s in samples
         ]
-        with open(prep_cfg["flat_instances_path"], "w", encoding="utf-8") as f:
-            json.dump(flat_data, f, ensure_ascii=False, indent=4)
+
+    if prep_cfg.get("flat_instances_path"):
+        flat_data = to_records(all_samples)
+        write_jsonl(prep_cfg["flat_instances_path"], flat_data)
         print(
             f"Saved flat: {prep_cfg['flat_instances_path']} ({len(flat_data)} samples)"
         )
@@ -110,29 +110,18 @@ def main():
     }
     write_json(prep_cfg["split_tools_path"], split_dict)
 
-    def to_records(samples):
-        return [
-            {
-                "Name": s["Name"],
-                "instance_id": s["instance_id"],
-                "process": s["data"][0],
-                "trainable": s["data"][1],
-            }
-            for s in samples
-        ]
-
     forget_data = to_records([s for s in all_samples if s["Name"] in tf_tools])
     retain_data = to_records([s for s in all_samples if s["Name"] in tr_tools])
 
-    for path, data in [
-        (prep_cfg["forget_output_path"], forget_data),
-        (prep_cfg["retain_output_path"], retain_data),
-    ]:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+    write_jsonl(prep_cfg["forget_output_path"], forget_data)
+    write_jsonl(prep_cfg["retain_output_path"], retain_data)
 
-    print(f"Forget: {len(tf_tools)} tools / {len(forget_data)} samples")
-    print(f"Retain: {len(tr_tools)} tools / {len(retain_data)} samples")
+    print(
+        f"Forget: {len(tf_tools)} tools / {len(forget_data)} samples -> {prep_cfg['forget_output_path']}"
+    )
+    print(
+        f"Retain: {len(tr_tools)} tools / {len(retain_data)} samples -> {prep_cfg['retain_output_path']}"
+    )
 
 
 if __name__ == "__main__":

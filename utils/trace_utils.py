@@ -1,7 +1,13 @@
 import re
 from typing import Any, Dict, List, Optional
 
-from utils.io_utils import safe_str, read_json
+from utils.io_utils import safe_str, read_json, read_jsonl
+
+
+def _load_split_file(path: str) -> list:
+    if path.endswith(".jsonl"):
+        return read_jsonl(path)
+    return read_json(path)
 
 
 _DOC_SKIP: frozenset[str] = frozenset({"Parameters", "Output", "Structure", "Format"})
@@ -36,6 +42,10 @@ GET_DETAILS_DESCRIPTION = (
     "Output: User's response."
 )
 
+_SKIP_NO_STEPS = "no intermediate_steps"
+_SKIP_TOO_MANY_STEPS = "too many steps (> 5)"
+_SKIP_ONLY_GET_DETAILS = "only used getDetails"
+
 
 def get_tool_names(nl_doc: str) -> str:
     names = [
@@ -47,11 +57,6 @@ def get_tool_names(nl_doc: str) -> str:
 
 
 def build_id_to_instance(train_tools: list) -> dict:
-    """Map instance_id -> instance, mirroring prep_train.py exactly.
-
-    Applies build_sample filter + duplicate-remap, so ids match those in
-    flat_instances / forget_train / retain_train produced by prep_train.py.
-    """
     mapping = {}
     used_ids: set = set()
     name_max_idx: dict = {}
@@ -79,15 +84,7 @@ def build_id_to_instance(train_tools: list) -> dict:
 
 
 def load_forget_instances(forget_data_path: str, train_tools_path: str) -> list:
-    """Shared helper: rebuild instance list from a flat split file + train_data.json.
-
-    Works for both forget_train.json and retain_train.json — the flat file only
-    carries (Name, instance_id); the full instance is back-resolved from train_data.
-
-    Returns a list of dicts with keys:
-        Name, instance_id, question, tool_names, nl_doc, gt_trace
-    """
-    forget_raw = read_json(forget_data_path)
+    forget_raw = _load_split_file(forget_data_path)
     train_tools = read_json(train_tools_path)
 
     train_map = {t["Name"]: t for t in train_tools}
@@ -244,13 +241,18 @@ def build_sample(
     api_info: Dict[str, Any],
     name: str = "",
     idx: int = -1,
+    verbose: bool = False,
 ) -> Optional[List]:
 
     label = f"{name}_{idx}" if name else str(idx)
 
     if not instance.get("intermediate_steps"):
+        if verbose:
+            print(f"Skipping {label}: {_SKIP_NO_STEPS}")
         return None
     if len(instance["intermediate_steps"]) > 5:
+        if verbose:
+            print(f"Skipping {label}: {_SKIP_TOO_MANY_STEPS}")
         return None
 
     question = instance.get("input", "").rsplit("\nHint: ", 1)[0]
@@ -271,6 +273,8 @@ def build_sample(
         used_tools.add(step[0][0])
 
     if len(used_tools) == 1 and list(used_tools)[0] == "getDetails":
+        if verbose:
+            print(f"Skipping {label}: {_SKIP_ONLY_GET_DETAILS}")
         return None
 
     final_thought = instance.get("Final Thought", "I now know the final answer.")
@@ -294,10 +298,6 @@ def build_dataset_for_api(api_info: Dict[str, Any]) -> List:
 
 
 def build_forget_rows(instances: list) -> list:
-    """Passthrough: gen_yprime.py outputs process/trainable directly.
-
-    Filters out rows with missing or empty process/trainable.
-    """
     rows = []
     for inst in instances:
         if not inst.get("process") or not inst.get("trainable"):
@@ -315,11 +315,6 @@ def build_forget_rows(instances: list) -> list:
 
 
 def build_retain_rows(records: list) -> list:
-    """Convert retain_train.json flat records into training rows.
-
-    Expects records in the format produced by prep_train.py:
-        {Name, instance_id, process, trainable, ...}
-    """
     rows = []
     for r in records:
         process = r.get("process")
