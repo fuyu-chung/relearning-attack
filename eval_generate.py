@@ -15,8 +15,7 @@ from utils.io_utils import (
 from utils.trace_utils import (
     get_tool_names,
     serialize_golden,
-    serialize_golden_from_steps,
-    build_id_to_instance,
+    load_forget_instances,
     PREFIX_TRAIN,
     FORMAT_INSTRUCTIONS_TRAIN,
     GET_DETAILS_DESCRIPTION,
@@ -37,21 +36,10 @@ def build_prompt(user_input: str, nl_doc: str, tool_names: str) -> str:
     )
 
 
-def load_data(cfg: dict) -> list:
-    eval_tools_path = resolve_config_key(cfg, "eval_tools_path")
-    train_tools_path = resolve_config_key(cfg, "train_tools_path")
-    forget_data_path = resolve_config_key(cfg, "forget_data_path")
-    retain_data_path = resolve_config_key(cfg, "retain_data_path")
-
+def load_eval_split(eval_tools_path: str) -> list:
+    """Load the held-out eval (test) split from eval_simulated.json."""
     eval_tools = read_json(eval_tools_path)
-    train_tools = read_json(train_tools_path)
-    forget_raw = read_json(forget_data_path)
-    retain_raw = read_json(retain_data_path)
-
-    train_map = {t["Name"]: t for t in train_tools}
-    id_to_instance = build_id_to_instance(train_tools)
-
-    eval_data = []
+    rows = []
     for t in eval_tools:
         name = t.get("Name", "")
         nl_doc = t.get("NLDocumentation", "")
@@ -62,7 +50,7 @@ def load_data(cfg: dict) -> list:
             gt_trace = serialize_golden(golden)
             if not instruction or not gt_trace:
                 continue
-            eval_data.append(
+            rows.append(
                 {
                     "Name": name,
                     "instance_id": f"{name}_{i}",
@@ -73,55 +61,50 @@ def load_data(cfg: dict) -> list:
                     "split": "test",
                 }
             )
+    return rows
 
-    def convert(raw: list, split: str) -> list:
-        rows = []
-        dropped = 0
-        for item in raw:
-            name = item.get("Name", "")
-            instance_id = item.get("instance_id", "")
-            if not name or not instance_id:
-                dropped += 1
-                continue
 
-            tool = train_map.get(name)
-            if not tool:
-                print(f"Drop {split}/{instance_id}: no tool {name}")
-                dropped += 1
-                continue
+def instances_to_eval_rows(instances: list, split: str) -> list:
+    """Reformat load_forget_instances output into eval rows.
 
-            inst = id_to_instance.get(instance_id)
-            if inst is None:
-                print(f"Drop {split}/{instance_id}: not found in id_to_instance")
-                dropped += 1
-                continue
+    load_forget_instances resolves Name, instance_id, question, tool_names,
+    nl_doc, and gt_trace for any flat split file.  This function just renames
+    'question' -> 'input' and attaches the split label.
+    """
+    rows = []
+    for inst in instances:
+        gt_trace = inst.get("gt_trace", "")
+        if not inst["question"] or not gt_trace:
+            print(f"Drop {split}/{inst['instance_id']}: empty input or gt_trace")
+            continue
+        rows.append(
+            {
+                "Name": inst["Name"],
+                "instance_id": inst["instance_id"],
+                "nl_doc": inst["nl_doc"],
+                "tool_names": inst["tool_names"],
+                "input": inst["question"],
+                "gt_trace": gt_trace,
+                "split": split,
+            }
+        )
+    return rows
 
-            nl_doc = tool.get("NLDocumentation", "")
-            tool_names = get_tool_names(nl_doc)
-            user_input = inst.get("input", "").rsplit("\nHint: ", 1)[0].strip()
-            gt_trace = serialize_golden_from_steps(inst.get("intermediate_steps", []))
 
-            if not user_input or not gt_trace:
-                print(f"Drop {split}/{instance_id}: empty input or gt_trace")
-                dropped += 1
-                continue
+def load_data(cfg: dict) -> list:
+    eval_tools_path = resolve_config_key(cfg, "eval_tools_path")
+    train_tools_path = resolve_config_key(cfg, "train_tools_path")
+    forget_data_path = resolve_config_key(cfg, "forget_data_path")
+    retain_data_path = resolve_config_key(cfg, "retain_data_path")
 
-            rows.append(
-                {
-                    "Name": name,
-                    "instance_id": instance_id,
-                    "nl_doc": nl_doc,
-                    "tool_names": tool_names,
-                    "input": user_input,
-                    "gt_trace": gt_trace,
-                    "split": split,
-                }
-            )
+    eval_data = load_eval_split(eval_tools_path)
 
-        return rows
-
-    forget_data = convert(forget_raw, "forget")
-    retain_data = convert(retain_raw, "retain")
+    # Both forget and retain use load_forget_instances — same lookup logic,
+    # only the source file differs. gt_trace is attached inside the helper.
+    forget_instances = load_forget_instances(forget_data_path, train_tools_path)
+    retain_instances = load_forget_instances(retain_data_path, train_tools_path)
+    forget_data = instances_to_eval_rows(forget_instances, "forget")
+    retain_data = instances_to_eval_rows(retain_instances, "retain")
 
     all_data = eval_data + forget_data + retain_data
     print(

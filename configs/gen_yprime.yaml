@@ -1,6 +1,6 @@
 # gen_yprime.py
 forget_data_path: out/forget_train.json
 train_tools_path: data/train_data.json
-model_path: TangQiaoYu/ToolAlpaca-7B
-output_path: out/forget_yprime.jsonl
-generation_max_new_tokens: 256
+model_path: lmsys/vicuna-7b-v1.3
+output_path: out/forget_yprime_new.json
+generation_max_new_tokens: 512

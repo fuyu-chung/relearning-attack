@@ -213,7 +213,6 @@ class ToolDeleteDataset(Dataset):
     def __init__(self, rows: list, tokenizer):
         super().__init__()
         self.tokenizer = tokenizer
-        # rows: list of dicts with process + trainable keys
         self.list_data = [[r["process"], r["trainable"]] for r in rows]
         self.cached: dict = {}
 
@@ -322,6 +321,7 @@ def main():
         required=False,
         default="out/forget_yprime.jsonl",
     )
+    # retain_train.json is the canonical output from prep_train.py
     retain_json = resolve_config_key(
         cfg,
         "retain_data_path",
@@ -374,7 +374,7 @@ def main():
     # forget rows: from gen_yprime output (Name, instance_id, question, y_prime)
     forget_rows = build_forget_rows(list(read_jsonl(forget_yprime_path)))
 
-    # retain rows: from retain_train.json (Name, instance_id, process, trainable)
+    # retain rows: from retain_train.json flat records (Name, instance_id, process, trainable)
     retain_rows = build_retain_rows(read_json(retain_json))
 
     train_rows = balance_and_merge(

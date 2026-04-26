@@ -264,11 +264,13 @@ def main():
                 print(f"Skip {instance_id}: {e}")
                 used, reason = False, ""
 
+            # pred_trace saved here so scores file is self-contained for debugging
             row = {
                 "Name": name,
                 "instance_id": instance_id,
                 "split": item.get("split", "unknown"),
                 "used_tool": used,
+                "pred_trace": item.get("pred_trace", ""),
             }
             f_scores.write(json.dumps(row, ensure_ascii=False) + "\n")
             f_scores.flush()
@@ -280,6 +282,8 @@ def main():
                             "Name": name,
                             "instance_id": instance_id,
                             "split": item.get("split", "unknown"),
+                            "gt_trace": item.get("gt_trace", ""),
+                            "pred_trace": item.get("pred_trace", ""),
                             "reason": reason,
                         },
                         ensure_ascii=False,

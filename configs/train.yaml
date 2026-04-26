@@ -1,8 +1,8 @@
 # train_tooldelete_sft.py
-forget_data_path: out/forget_yprime.jsonl
-retain_data_path: out/retain_sft.jsonl
+forget_data_path: out/forget_yprime_new.jsonl
+retain_data_path: out/retain_train.json
 retain_sample_mode: stratified
 retain_ratio: 2.0
 model_output_dir: tooldelete_sft_model_test
 ta_alpha: 0.3
-base_model_path: TangQiaoYu/ToolAlpaca-7B
+model_path: TangQiaoYu/ToolAlpaca-7B

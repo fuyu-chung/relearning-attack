@@ -1,7 +1,7 @@
 import re
 from typing import Any, Dict, List, Optional
 
-from utils.io_utils import safe_str
+from utils.io_utils import safe_str, read_json
 
 
 _DOC_SKIP: frozenset[str] = frozenset({"Parameters", "Output", "Structure", "Format"})
@@ -36,10 +36,6 @@ GET_DETAILS_DESCRIPTION = (
     "Output: User's response."
 )
 
-_SKIP_NO_STEPS = "no intermediate_steps"
-_SKIP_TOO_MANY_STEPS = "too many steps (> 5)"
-_SKIP_ONLY_GET_DETAILS = "only used getDetails"
-
 
 def get_tool_names(nl_doc: str) -> str:
     names = [
@@ -48,6 +44,91 @@ def get_tool_names(nl_doc: str) -> str:
         if m not in _DOC_SKIP
     ]
     return ", ".join(names) if names else ""
+
+
+def build_id_to_instance(train_tools: list) -> dict:
+    """Map instance_id -> instance, mirroring prep_train.py exactly.
+
+    Applies build_sample filter + duplicate-remap, so ids match those in
+    flat_instances / forget_train / retain_train produced by prep_train.py.
+    """
+    mapping = {}
+    used_ids: set = set()
+    name_max_idx: dict = {}
+
+    for tool in train_tools:
+        name = tool.get("Name", "")
+        for raw_idx, inst in enumerate(tool.get("Instances", [])):
+            if build_sample(inst, tool, name=name, idx=raw_idx) is None:
+                continue
+
+            base_id = f"{name}_{raw_idx}"
+            if base_id not in used_ids:
+                instance_id = base_id
+                used_ids.add(instance_id)
+                name_max_idx[name] = max(name_max_idx.get(name, -1), raw_idx)
+            else:
+                next_idx = name_max_idx.get(name, raw_idx) + 1
+                instance_id = f"{name}_{next_idx}"
+                used_ids.add(instance_id)
+                name_max_idx[name] = next_idx
+
+            mapping[instance_id] = inst
+
+    return mapping
+
+
+def load_forget_instances(forget_data_path: str, train_tools_path: str) -> list:
+    """Shared helper: rebuild instance list from a flat split file + train_data.json.
+
+    Works for both forget_train.json and retain_train.json — the flat file only
+    carries (Name, instance_id); the full instance is back-resolved from train_data.
+
+    Returns a list of dicts with keys:
+        Name, instance_id, question, tool_names, nl_doc, gt_trace
+    """
+    forget_raw = read_json(forget_data_path)
+    train_tools = read_json(train_tools_path)
+
+    train_map = {t["Name"]: t for t in train_tools}
+    id_to_instance = build_id_to_instance(train_tools)
+
+    data = []
+    for item in forget_raw:
+        name = item.get("Name", "")
+        instance_id = item.get("instance_id", "")
+        if not name or not instance_id:
+            continue
+
+        inst = id_to_instance.get(instance_id)
+        if inst is None:
+            print(f"Drop {instance_id}: not found in id_to_instance")
+            continue
+
+        tool = train_map.get(name, {})
+        question = inst.get("input", "").rsplit("\nHint: ", 1)[0].strip()
+        nl_doc = tool.get("NLDocumentation", "")
+        tool_names = get_tool_names(nl_doc)
+        gt_trace = serialize_golden_from_steps(inst.get("intermediate_steps", []))
+
+        if not question:
+            continue
+
+        data.append(
+            {
+                "Name": name,
+                "instance_id": instance_id,
+                "question": question,
+                "tool_names": tool_names,
+                "nl_doc": nl_doc,
+                "gt_trace": gt_trace,
+            }
+        )
+    if len(data) < len(forget_raw):
+        print(
+            f"  Loaded {len(data)}/{len(forget_raw)} instances (dropped {len(forget_raw) - len(data)})"
+        )
+    return data
 
 
 def serialize_golden(actions: list, include_observation: bool = False) -> str:
@@ -168,10 +249,8 @@ def build_sample(
     label = f"{name}_{idx}" if name else str(idx)
 
     if not instance.get("intermediate_steps"):
-        print(f"Skipping {label}: {_SKIP_NO_STEPS}")
         return None
     if len(instance["intermediate_steps"]) > 5:
-        print(f"Skipping {label}: {_SKIP_TOO_MANY_STEPS}")
         return None
 
     question = instance.get("input", "").rsplit("\nHint: ", 1)[0]
@@ -192,7 +271,6 @@ def build_sample(
         used_tools.add(step[0][0])
 
     if len(used_tools) == 1 and list(used_tools)[0] == "getDetails":
-        print(f"Skipping {label}: {_SKIP_ONLY_GET_DETAILS}")
         return None
 
     final_thought = instance.get("Final Thought", "I now know the final answer.")
@@ -216,42 +294,45 @@ def build_dataset_for_api(api_info: Dict[str, Any]) -> List:
 
 
 def build_forget_rows(instances: list) -> list:
+    """Passthrough: gen_yprime.py outputs process/trainable directly.
+
+    Filters out rows with missing or empty process/trainable.
+    """
     rows = []
     for inst in instances:
-        question = inst.get("question", "").strip()
-        y_prime = inst.get("y_prime", "").strip()
-        if not question or not y_prime:
+        if not inst.get("process") or not inst.get("trainable"):
             continue
         rows.append(
             {
                 "Name": inst.get("Name", ""),
                 "instance_id": inst.get("instance_id", ""),
                 "split": "forget",
-                "process": [f"Question: {question}\nAnswer: {y_prime}"],
-                "trainable": [True],
+                "process": inst["process"],
+                "trainable": inst["trainable"],
             }
         )
     return rows
 
 
-def build_retain_rows(tools: list, tr_tools: set) -> list:
+def build_retain_rows(records: list) -> list:
+    """Convert retain_train.json flat records into training rows.
+
+    Expects records in the format produced by prep_train.py:
+        {Name, instance_id, process, trainable, ...}
+    """
     rows = []
-    for t in tools:
-        name = t.get("Name", "")
-        if name not in tr_tools:
+    for r in records:
+        process = r.get("process")
+        trainable = r.get("trainable")
+        if not process or not trainable:
             continue
-        for idx, inst in enumerate(t.get("Instances", [])):
-            sample = build_sample(inst, t, name=name, idx=idx)
-            if sample is None:
-                continue
-            process, trainable = sample
-            rows.append(
-                {
-                    "Name": name,
-                    "instance_id": f"{name}_{idx}",
-                    "split": "retain",
-                    "process": process,
-                    "trainable": trainable,
-                }
-            )
+        rows.append(
+            {
+                "Name": r.get("Name", ""),
+                "instance_id": r.get("instance_id", ""),
+                "split": "retain",
+                "process": process,
+                "trainable": trainable,
+            }
+        )
     return rows
