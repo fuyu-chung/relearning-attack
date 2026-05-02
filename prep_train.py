@@ -4,7 +4,7 @@ import random
 from typing import Any, Dict, List
 
 from utils.io_utils import ensure_dir, read_json, write_json, write_jsonl, load_config
-from utils.trace_utils import build_sample
+from utils.trace_utils import build_sample, build_id_to_instance
 
 
 def main():
@@ -38,29 +38,20 @@ def main():
     if not isinstance(tools, list):
         raise ValueError("Expected a list of tools in input JSON.")
 
-    used_ids: set = set()
-    name_max_idx: Dict[str, int] = {}
+    id_to_instance = build_id_to_instance(tools)
+    inst_to_id = {id(inst): iid for iid, inst in id_to_instance.items()}
+
     all_samples: List[Dict[str, Any]] = []
 
     for api in tools:
         name = api.get("Name", "")
-        instances = api.get("Instances", [])
-        for raw_idx, inst in enumerate(instances):
+        for raw_idx, inst in enumerate(api.get("Instances", [])):
             sample = build_sample(inst, api, name=name, idx=raw_idx, verbose=True)
             if sample is None:
                 continue
-
-            base_id = f"{name}_{raw_idx}"
-            if base_id not in used_ids:
-                instance_id = base_id
-                used_ids.add(instance_id)
-                name_max_idx[name] = max(name_max_idx.get(name, -1), raw_idx)
-            else:
-                next_idx = name_max_idx.get(name, raw_idx) + 1
-                instance_id = f"{name}_{next_idx}"
-                used_ids.add(instance_id)
-                name_max_idx[name] = next_idx
-
+            instance_id = inst_to_id.get(id(inst))
+            if instance_id is None:
+                continue
             all_samples.append(
                 {
                     "Name": name,

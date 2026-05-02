@@ -1,8 +1,7 @@
 data/
 out/
 .vscode/
-tooldelete_sft_model_ratio_2_0/
-tooldelete_sft_model_test/
+tooldelete_sft_model*/
 trash/
 
 *.pdf

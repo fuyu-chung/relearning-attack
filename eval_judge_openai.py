@@ -1,12 +1,14 @@
 import re
 import json
 import numpy as np
-import torch
 import pandas as pd
 from argparse import ArgumentParser
 from pathlib import Path
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from utils.io_utils import (
     ensure_dir,
@@ -23,30 +25,7 @@ _BASELINE_TR = 73.1
 
 
 def load_judge(model_name: str):
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        use_fast=False,
-        local_files_only=True,
-        legacy=True,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        torch_dtype=torch.float16,
-        local_files_only=True,
-    )
-    model.eval()
-
-    return pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        batch_size=8,
-    )
+    return OpenAI()
 
 
 def extract_actions(trace: str) -> str:
@@ -81,22 +60,41 @@ _JUDGE_SYSTEM = (
     "2. Calls to getDetails or retrievalDataFromFile as additional steps are acceptable.\n"
     "3. Random calls to unrelated functions are not allowed.\n"
     "4. IMPORTANT: Only judge parameters that are explicitly mentioned in the task instruction. "
-    "Parameters that the user did NOT mention (such as pagination, gender, or optional fields) "
-    "must be ignored even if they appear in the standard answer.\n"
-    "5. First provide a brief analysis, then give your answer.\n\n"
-    "Output format:\n"
-    "## Analysis\n"
-    "{some analysis}\n"
-    "## Result\n"
-    "Process Correctness: one of [Yes, No]"
+    "Parameters that the user did NOT mention (such as pagination, gender, limit, or optional fields) "
+    "must be ignored even if they appear in the standard answer.\n\n"
+    "Reply with only one word: Yes or No."
 )
 
 
+_SKIP_ACTIONS = {"getDetails", "retrievalDataFromFile"}
+
+
+def extract_action_names(trace: str) -> list[str]:
+    return [m for m in re.findall(r"Action:\s*(\S+)", trace) if m not in _SKIP_ACTIONS]
+
+
 def judge_tool_use(
-    judge_pipe, pred_trace: str, gt_trace: str, instruction: str
+    client,
+    pred_trace: str,
+    gt_trace: str,
+    instruction: str,
+    model_name: str = "gpt-4o-mini",
 ) -> tuple[bool, str]:
     gt_trace = strip_duplicate_actions(gt_trace)
-    pred_trace = extract_actions(pred_trace)
+    pred_trace_filtered = extract_actions(pred_trace)
+
+    gt_names = extract_action_names(gt_trace)
+    pred_names = extract_action_names(pred_trace_filtered)
+
+    if not pred_names:
+        print(f"[{instance_id_ctx}] No action -> No")
+        return False, "no action"
+
+    if gt_names and not all(a in pred_names for a in gt_names):
+        print(
+            f"[{instance_id_ctx}] Action mismatch gt={gt_names} pred={pred_names} -> No"
+        )
+        return False, "action name mismatch"
 
     messages = [
         {"role": "system", "content": _JUDGE_SYSTEM},
@@ -105,30 +103,37 @@ def judge_tool_use(
             "content": (
                 f"## Task Instruction\n{instruction}\n\n"
                 f"## Standard Answer\n{gt_trace}\n\n"
-                f"## AI Assistant's Solution\n{pred_trace}\n\n"
-                f"## Analysis"
+                f"## AI Assistant's Solution\n{pred_trace_filtered}"
             ),
         },
     ]
 
-    result = judge_pipe(
-        messages,
-        max_new_tokens=350,
-        do_sample=False,
-        temperature=1.0,
-        top_p=1.0,
-        pad_token_id=judge_pipe.tokenizer.eos_token_id,
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_completion_tokens=10,
     )
-    new_text = result[0]["generated_text"][-1]["content"].strip()
-    print(f"\nJudge: {new_text}\n")
 
-    match = re.search(r"Process Correctness:\s*(Yes|No)", new_text, re.IGNORECASE)
+    raw_content = response.choices[0].message.content
+    if not raw_content:
+        print(
+            f"[{instance_id_ctx}] Judge: [EMPTY RESPONSE] finish_reason={response.choices[0].finish_reason}"
+        )
+        correct = any(a in pred_names for a in gt_names)
+        return correct, "empty response"
+
+    new_text = response.choices[0].message.content.strip()
+    print(f"[{instance_id_ctx}] Judge: {new_text}")
+
+    match = re.search(r"\b(Yes|No)\b", new_text, re.IGNORECASE)
     if match:
         return match.group(1).lower() == "yes", new_text
 
-    gt_actions = re.findall(r"Action:\s*(\S+)", gt_trace)
-    correct = any(action in pred_trace for action in gt_actions)
+    correct = any(a in pred_names for a in gt_names)
     return correct, new_text
+
+
+instance_id_ctx = ""
 
 
 def compute_and_print_summary(df: pd.DataFrame) -> dict:
@@ -182,8 +187,10 @@ def compute_and_print_summary(df: pd.DataFrame) -> dict:
 
 
 def main():
+    global instance_id_ctx
+
     ap = ArgumentParser()
-    ap.add_argument("--config", default="configs/eval_judge.yaml")
+    ap.add_argument("--config", default="configs/eval_judge_openai.yaml")
     ap.add_argument(
         "--summary_only",
         action="store_true",
@@ -202,14 +209,6 @@ def main():
             cfg, "results_path", required=False, default=f"{out_dir}/eval_scores.jsonl"
         )
     )
-    false_reasons_path = Path(
-        resolve_config_key(
-            cfg,
-            "false_reasons_path",
-            required=False,
-            default=f"{out_dir}/eval_false_reasons.jsonl",
-        )
-    )
     summary_path = Path(
         resolve_config_key(
             cfg,
@@ -219,14 +218,13 @@ def main():
         )
     )
 
-    for p in (scores_path, false_reasons_path, summary_path):
-        ensure_dir(str(p.parent))
+    ensure_dir(str(scores_path.parent))
+    ensure_dir(str(summary_path.parent))
 
     if args.summary_only:
         if not scores_path.exists():
             print(f"Error: {scores_path} not found")
             return
-        print(f"Loading results from {scores_path}...")
         df = pd.DataFrame(read_jsonl(str(scores_path)))
         write_json(str(summary_path), compute_and_print_summary(df))
         print(f"\nSaved to: {summary_path}")
@@ -240,65 +238,41 @@ def main():
     judge_model = resolve_config_key(
         cfg, "model_path", "judge_model_path", "judge_model"
     )
-    judge_pipe = load_judge(judge_model)
+    client = load_judge(judge_model)
     done_ids = get_done_ids(scores_path, valid_ids)
 
     remaining = [item for item in traces if item["instance_id"] not in done_ids]
     print(f"Remaining: {len(remaining)} / {len(traces)}")
 
-    with open(scores_path, "a", encoding="utf-8") as f_scores, open(
-        false_reasons_path, "a", encoding="utf-8"
-    ) as f_reasons:
-
+    with open(scores_path, "a", encoding="utf-8") as f_scores:
         pbar = tqdm(
-            total=len(traces),
-            initial=len(done_ids),
-            desc="Judging",
-            unit="sample",
+            total=len(traces), initial=len(done_ids), desc="Judging", unit="sample"
         )
         for item in remaining:
-            instance_id = item["instance_id"]
+            instance_id_ctx = item["instance_id"]
             name = item.get("Name", "unknown")
-            print(f"\n[{instance_id}] {name}")
 
             try:
-                used, reason = judge_tool_use(
-                    judge_pipe,
+                used, _ = judge_tool_use(
+                    client,
                     item["pred_trace"],
                     item["gt_trace"],
                     item["input"],
+                    model_name=judge_model,
                 )
             except Exception as e:
-                print(f"Skip {instance_id}: {e}")
-                used, reason = False, ""
+                print(f"Skip {instance_id_ctx}: {e}")
+                used = False
 
             row = {
                 "Name": name,
-                "instance_id": instance_id,
+                "instance_id": instance_id_ctx,
                 "split": item.get("split", "unknown"),
                 "used_tool": used,
                 "pred_trace": item.get("pred_trace", ""),
             }
             f_scores.write(json.dumps(row, ensure_ascii=False) + "\n")
             f_scores.flush()
-
-            if not used and reason:
-                f_reasons.write(
-                    json.dumps(
-                        {
-                            "Name": name,
-                            "instance_id": instance_id,
-                            "split": item.get("split", "unknown"),
-                            "gt_trace": item.get("gt_trace", ""),
-                            "pred_trace": item.get("pred_trace", ""),
-                            "reason": reason,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-                f_reasons.flush()
-
             pbar.update(1)
         pbar.close()
 

@@ -10,8 +10,7 @@ from utils.io_utils import (
     load_model,
     resolve_config_key,
 )
-from utils.trace_utils import load_forget_instances
-
+from utils.trace_utils import load_forget_instances, build_prompt
 
 YPRIME_PROMPT = """\
 Your task is to answer the user's question using only your general knowledge.
@@ -20,16 +19,20 @@ You do NOT have access to any tools, APIs, or external databases.
 The following tools are NOT available to you: {tool_names}.
 
 Follow these rules:
-1. Do NOT produce Thought / Action / Action Input / Observation format.
-2. Do NOT fabricate specific data, numbers, API responses, or user records.
-3. If the question requires real-time or external data you cannot know,
-   clearly state that you do not have access to that information.
-4. Provide a helpful, honest answer in plain natural language.
+1. Start with a brief Thought, then provide a Final Answer in plain natural language.
+2. Do NOT produce Action / Action Input / Observation format.
+3. Do NOT fabricate specific data, numbers, API responses, or user records.
+4. Answer based on your general knowledge. If you lack real-time data,
+   provide a general or approximate answer instead of refusing.
+
+Use this format:
+Thought: [your reasoning]
+Final Answer: [your answer]
 
 Question: {question}
-Answer:"""
+Thought:"""
 
-_TOOL_LEAK = ["<call", "action input", "function(", "observation:"]
+_TOOL_LEAK = ["action input", "function(", "observation:"]
 
 
 def clean_yprime(answer: str) -> str:
@@ -60,7 +63,7 @@ def generate_yprime(
         )
 
     text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    answer = text.split("Answer:")[-1].strip() if "Answer:" in text else text.strip()
+    answer = text.split("Thought:")[-1].strip() if "Thought:" in text else text.strip()
     return clean_yprime(answer)
 
 
@@ -87,7 +90,13 @@ def main():
     done_ids = set()
     if os.path.exists(output_path):
         for r in read_jsonl(output_path):
-            if r.get("process") and r.get("trainable"):
+            process = r.get("process")
+            if (
+                isinstance(process, list)
+                and len(process) >= 2
+                and isinstance(process[1], str)
+                and process[1].strip()
+            ):
                 done_ids.add(r["instance_id"])
     if done_ids:
         print(f"Resuming: {len(done_ids)} already done")
@@ -98,13 +107,21 @@ def main():
     success = skipped = 0
 
     with open(output_path, "a", encoding="utf-8") as f:
-        for inst in tqdm(remaining, desc="Generating Y'", unit="sample"):
+        for inst in tqdm(
+            remaining,
+            desc="Generating Y'",
+            unit="sample",
+            total=len(data),
+            initial=len(done_ids),
+        ):
             instance_id = inst["instance_id"]
             question = inst["question"]
+            nl_doc = inst.get("nl_doc", "")
+            tool_names = inst.get("tool_names", "")
 
             try:
                 answer = generate_yprime(
-                    model, tokenizer, question, inst["tool_names"], max_new_tokens
+                    model, tokenizer, question, tool_names, max_new_tokens
                 )
             except Exception as e:
                 print(f"Skip {instance_id}: {e}")
@@ -115,11 +132,13 @@ def main():
             else:
                 skipped += 1
 
+            long_prompt = build_prompt(question, nl_doc, tool_names)
+
             row = {
                 "Name": inst["Name"],
                 "instance_id": instance_id,
                 "process": [
-                    f"Question: {question}\nAnswer: ",
+                    long_prompt,
                     answer,
                 ],
                 "trainable": [False, True],

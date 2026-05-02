@@ -1,4 +1,5 @@
 import re
+import torch
 from typing import Any, Dict, List, Optional
 
 from utils.io_utils import safe_str, read_json, read_jsonl
@@ -54,6 +55,43 @@ def get_tool_names(nl_doc: str) -> str:
         if m not in _DOC_SKIP
     ]
     return ", ".join(names) if names else ""
+
+
+def build_prompt(user_input: str, nl_doc: str, tool_names: str) -> str:
+    all_tool_names = f"getDetails, {tool_names}" if tool_names else "getDetails"
+    fmt = FORMAT_INSTRUCTIONS_TRAIN.replace("{tool_names}", all_tool_names)
+    return (
+        f"{PREFIX_TRAIN}\n\n"
+        f"{GET_DETAILS_DESCRIPTION}\n"
+        f"{nl_doc}\n\n"
+        f"{fmt}\n\n"
+        f"Begin!\n\n"
+        f"Question: {user_input}\n"
+        "Thought:"
+    )
+
+
+def generate_trace(
+    tokenizer, model, user_input: str, nl_doc: str, tool_names: str
+) -> str:
+    prompt = build_prompt(user_input, nl_doc, tool_names)
+    inputs = tokenizer(
+        prompt, return_tensors="pt", truncation=True, max_length=4096
+    ).to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=512,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    return tokenizer.decode(
+        outputs[0][inputs["input_ids"].shape[1] :],
+        skip_special_tokens=True,
+    ).strip()
 
 
 def build_id_to_instance(train_tools: list) -> dict:

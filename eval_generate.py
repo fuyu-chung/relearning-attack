@@ -16,28 +16,11 @@ from utils.trace_utils import (
     get_tool_names,
     serialize_golden,
     load_forget_instances,
-    PREFIX_TRAIN,
-    FORMAT_INSTRUCTIONS_TRAIN,
-    GET_DETAILS_DESCRIPTION,
+    generate_trace,
 )
 
 
-def build_prompt(user_input: str, nl_doc: str, tool_names: str) -> str:
-    all_tool_names = f"getDetails, {tool_names}" if tool_names else "getDetails"
-    fmt = FORMAT_INSTRUCTIONS_TRAIN.replace("{tool_names}", all_tool_names)
-    return (
-        f"{PREFIX_TRAIN}\n\n"
-        f"{GET_DETAILS_DESCRIPTION}\n"
-        f"{nl_doc}\n\n"
-        f"{fmt}\n\n"
-        f"Begin!\n\n"
-        f"Question: {user_input}\n"
-        "Thought:"
-    )
-
-
 def load_eval_split(eval_tools_path: str) -> list:
-    """Load the held-out eval (test) split from eval_simulated.json."""
     eval_tools = read_json(eval_tools_path)
     rows = []
     for t in eval_tools:
@@ -65,12 +48,6 @@ def load_eval_split(eval_tools_path: str) -> list:
 
 
 def instances_to_eval_rows(instances: list, split: str) -> list:
-    """Reformat load_forget_instances output into eval rows.
-
-    load_forget_instances resolves Name, instance_id, question, tool_names,
-    nl_doc, and gt_trace for any flat split file.  This function just renames
-    'question' -> 'input' and attaches the split label.
-    """
     rows = []
     for inst in instances:
         gt_trace = inst.get("gt_trace", "")
@@ -99,8 +76,6 @@ def load_data(cfg: dict) -> list:
 
     eval_data = load_eval_split(eval_tools_path)
 
-    # Both forget and retain use load_forget_instances — same lookup logic,
-    # only the source file differs. gt_trace is attached inside the helper.
     forget_instances = load_forget_instances(forget_data_path, train_tools_path)
     retain_instances = load_forget_instances(retain_data_path, train_tools_path)
     forget_data = instances_to_eval_rows(forget_instances, "forget")
@@ -112,29 +87,6 @@ def load_data(cfg: dict) -> list:
     )
     print(f"Total samples: {len(all_data)}")
     return all_data
-
-
-def generate_trace(
-    tokenizer, model, user_input: str, nl_doc: str, tool_names: str
-) -> str:
-    prompt = build_prompt(user_input, nl_doc, tool_names)
-    inputs = tokenizer(
-        prompt, return_tensors="pt", truncation=True, max_length=4096
-    ).to(model.device)
-
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=512,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-
-    return tokenizer.decode(
-        outputs[0][inputs["input_ids"].shape[1] :],
-        skip_special_tokens=True,
-    ).strip()
 
 
 def main():
@@ -181,6 +133,11 @@ def main():
             except Exception as e:
                 print(f"Skip {instance_id}: {e}")
                 pred_trace = ""
+
+            if not pred_trace:
+                print(f"Skip {instance_id}: empty pred_trace, will retry next run")
+                pbar.update(1)
+                continue
 
             row = {
                 "Name": item["Name"],
